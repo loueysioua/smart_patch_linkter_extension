@@ -15,6 +15,7 @@ class SmartPatchEngine:
         self.sbert = SentenceTransformer('all-MiniLM-L6-v2')
         self.datasets = {}
         self.models = {}
+        self.thresholds = {}
         self.loaded_projects = []
 
     def load_project(self, project_key, csv_path, model_path):
@@ -33,7 +34,13 @@ class SmartPatchEngine:
         self.datasets[project_key] = df
         
         print(f"   -> Loading {project_key} model...")
-        self.models[project_key] = joblib.load(model_path)
+        loaded_obj = joblib.load(model_path)
+        if isinstance(loaded_obj, dict) and "model" in loaded_obj:
+            self.models[project_key] = loaded_obj["model"]
+            self.thresholds[project_key] = loaded_obj.get("threshold", 0.5)
+        else:
+            self.models[project_key] = loaded_obj
+            self.thresholds[project_key] = 0.5
         self.loaded_projects.append(project_key)
 
     def _safe_parse_list(self, x):
@@ -103,6 +110,7 @@ class SmartPatchEngine:
             X = X[model.feature_names_in_]
 
         probs = model.predict_proba(X)[:, 1]
+        threshold = self.thresholds.get(project, 0.5)
 
         # 4. Format Results
         results = []
@@ -110,6 +118,7 @@ class SmartPatchEngine:
             results.append({
                 "patch_id": pid,
                 "score": float(score),
+                "is_related": bool(score >= threshold),
                 "created_time": date.strftime("%Y-%m-%d"),
                 "title": title
             })

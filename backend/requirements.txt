@@ -6,3 +6,5 @@ scikit-learn
 sentence-transformers
 requests
 joblib
+google-genai
+
