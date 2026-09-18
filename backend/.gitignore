@@ -1,1 +1,30 @@
-datasets
+# ---- Python artifacts ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+
+# ---- Secrets & local config ----
+.env
+
+# ---- Data / large files ----
+datasets/
+models/
+data/
+
+# ---- Logs ----
+*.log
+train_run.log
+
+# ---- FAISS / numpy caches ----
+*.index
+*_embeddings.npy
+
+# ---- Misc ----
+.DS_Store

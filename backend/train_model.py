@@ -583,7 +583,7 @@ def main():
     model = train_model(X_train, y_train, group_sizes_train, X_test, y_test, group_sizes_test,
                          feature_cols, lgb_params, args.num_boost_round, args.early_stopping_rounds)
 
-    eval_windows = [2, 7, 14, 30]
+    eval_windows = [2]
     eval_top_ks  = [1, 2, 4, 6, 8, 10]
 
     print("\n" + "=" * 60)
