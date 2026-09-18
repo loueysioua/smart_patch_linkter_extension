@@ -1,65 +1,137 @@
-from flask import Flask, request, jsonify
+"""
+SmartPatch RAG API — Flask application entry-point.
+
+Routes
+------
+GET  /health          — Liveness check; lists loaded projects.
+POST /predict_topk    — Find top-k similar patches for a given patch ID.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import traceback
+
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-from core.engine import SmartPatchEngine
+
+import config
 from core.gerrit import GerritClient
+from core.improved_rag_engine import ImprovedRAGEngine
 
-app = Flask(__name__)
-CORS(app)
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
-# --- STARTUP ---
-engine = SmartPatchEngine()
+# ---------------------------------------------------------------------------
+# App factory
+# ---------------------------------------------------------------------------
 
-# Configure your paths here!
-DATA_DIR = "data"
-engine.load_project("openstack", f"{DATA_DIR}/openstack/all_candidates.csv", f"{DATA_DIR}/openstack/model_openstack.pkl")
-# engine.load_project("qt", f"{DATA_DIR}/qt/all_candidates.csv", f"{DATA_DIR}/qt/model_qt_global.pkl")
-# engine.load_project("android", f"{DATA_DIR}/android/all_candidates.csv", f"{DATA_DIR}/android/model_android.pkl")
+def create_app() -> Flask:
+    """Create and configure the Flask application."""
+    app = Flask(__name__)
+    CORS(app)
 
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({"status": "active", "loaded_projects": engine.loaded_projects})
+    # --- Initialise RAG engine ---
+    engine = ImprovedRAGEngine()
 
-@app.route('/predict_topk', methods=['POST'])
-def predict_topk():
-    data = request.json
-    project = data.get("project", "").lower()
-    patch_id = str(data.get("patch_id", "")).strip()
-    window = int(data.get("time_window", 14))
-    top_k = int(data.get("top_k", 5))
+    for project in config.PROJECTS:
+        csv_path = os.path.join(config.DATA_DIR, project, "all_candidates.csv")
+        engine.load_project(project, csv_path)
 
-    if project not in engine.loaded_projects:
-        return jsonify({"error": f"Project '{project}' not loaded or supported."}), 400
+    # Attach engine to app so routes can access it
+    app.engine = engine  # type: ignore[attr-defined]
 
-    # 1. Get Reference Patch Details (from CSV or API)
-    # Check if inside dataset first (faster)
-    df = engine.datasets[project]
-    existing_row = df[df.patch_id == patch_id]
-    
-    if not existing_row.empty:
-        # Use cached data
-        row = existing_row.iloc[0]
-        patch_ref = {
-            "patch_id": row.patch_id,
-            "title": row.title,
-            "description": row.description,
-            "created_time": row.created_time,
-            "files": engine._safe_parse_list(row.files)
-        }
-    else:
-        # Fetch from API
-        patch_ref = GerritClient.get_patch_details(project, patch_id)
-        if not patch_ref:
-            return jsonify({"error": "Patch not found in dataset or Gerrit API"}), 404
+    # --- Register routes ---
+    @app.route("/health", methods=["GET"])
+    def health():
+        """Liveness probe — returns loaded project list."""
+        return jsonify({
+            "status": "active",
+            "loaded_projects": engine.loaded_projects,
+        })
 
-    # 2. Run Prediction
-    try:
-        results = engine.predict(project, patch_ref, top_k=top_k, window_days=window)
-        return jsonify(results)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+    @app.route("/predict_topk", methods=["POST"])
+    def predict_topk():
+        """Find top-k semantically similar patches for a given patch ID.
 
-if __name__ == '__main__':
-    print("🚀 SmartPatch Server running on http://0.0.0.0:5000")
-    app.run(host="0.0.0.0", port=5000, debug=True)
+        Request body (JSON)
+        -------------------
+        project     : str  — Project key (e.g. ``"onap"``).
+        patch_id    : str  — Target patch ID.
+        time_window : int  — Time window in days (default: ``14``).
+        top_k       : int  — Number of results (default: ``5``).
+        strategy    : str  — Retrieval strategy: ``"multi_query"`` (default),
+                             ``"hybrid"``, or ``"file_boost"``.
+
+        Returns
+        -------
+        JSON array of similar patches ranked by score.
+        """
+        data = request.get_json(silent=True) or {}
+        project: str = str(data.get("project", "")).strip().lower()
+        patch_id: str = str(data.get("patch_id", "")).strip()
+        window: int = int(data.get("time_window", config.DEFAULT_WINDOW_DAYS))
+        top_k: int = int(data.get("top_k", config.DEFAULT_TOP_K))
+        strategy: str = str(data.get("strategy", config.RETRIEVAL_STRATEGY))
+
+        if not project or project not in engine.loaded_projects:
+            return jsonify({
+                "error": f"Project '{project}' is not loaded. "
+                         f"Available: {engine.loaded_projects}"
+            }), 400
+
+        if not patch_id:
+            return jsonify({"error": "Missing required field: patch_id"}), 400
+
+        # --- Resolve patch reference ---
+        df = engine.datasets[project]
+        existing = df[df.patch_id == patch_id]
+
+        if not existing.empty:
+            row = existing.iloc[0]
+            patch_ref = {
+                "patch_id": row.patch_id,
+                "title": row.title,
+                "description": row.description,
+                "created_time": row.created_time,
+                "files": engine._safe_parse_list(row.files),
+            }
+        else:
+            logger.info("Patch %s not in dataset — fetching from Gerrit API.", patch_id)
+            patch_ref = GerritClient.get_patch_details(project, patch_id)
+            if not patch_ref:
+                return jsonify({
+                    "error": f"Patch '{patch_id}' not found in dataset or Gerrit API."
+                }), 404
+
+        # --- Run prediction ---
+        try:
+            results = engine.predict(
+                project, patch_ref, top_k=top_k, window_days=window, strategy=strategy
+            )
+            return jsonify(results)
+        except Exception as exc:
+            logger.error("Prediction failed for patch %s: %s", patch_id, exc)
+            logger.debug(traceback.format_exc())
+            return jsonify({"error": str(exc)}), 500
+
+    return app
+
+
+# ---------------------------------------------------------------------------
+# Entry-point
+# ---------------------------------------------------------------------------
+
+app = create_app()
+
+if __name__ == "__main__":
+    logger.info("🚀 SmartPatch RAG Server — http://%s:%d", config.HOST, config.PORT)
+    app.run(host=config.HOST, port=config.PORT, debug=config.DEBUG)

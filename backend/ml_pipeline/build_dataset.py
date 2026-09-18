@@ -149,6 +149,27 @@ def process_change_dir(change_dir: Path):
         change_comments = comments_data.get("change_comments") or []
         inline_comments = comments_data.get("inline_comments") or []
     comments = json.dumps(change_comments + inline_comments, ensure_ascii=False)
+    all_comments = []
+    
+    def _extract_comments(c_data):
+        if not c_data:
+            return
+        if isinstance(c_data, list):
+            for item in c_data:
+                _extract_comments(item)
+            return
+        if isinstance(c_data, dict):
+            for key in ("change_comments", "inline_comments"):
+                val = c_data.get(key)
+                if isinstance(val, list):
+                    all_comments.extend(val)
+                elif isinstance(val, dict):
+                    for sub_val in val.values():
+                        if isinstance(sub_val, list):
+                            all_comments.extend(sub_val)
+
+    _extract_comments(comments_data)
+    comments = json.dumps(all_comments, ensure_ascii=False)
 
     return {
         "patch_id":        patch_id,

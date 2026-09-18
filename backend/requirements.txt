@@ -7,4 +7,6 @@ sentence-transformers
 requests
 joblib
 google-genai
-
+faiss-cpu
+openai
+python-dotenv
