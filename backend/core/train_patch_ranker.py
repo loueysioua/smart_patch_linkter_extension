@@ -40,15 +40,8 @@ Design notes / assumptions (see conversation for rationale):
     anchor (the earlier-created patch of the two). This avoids duplicate,
     identical feature rows and avoids the same pair leaking across the
     train/test split.
-  - Candidates for an anchor are pulled from a hybrid pool: everything in
-    the full dataset within a +/- `window_days` window, UNION the top
-    `--ann-k` nearest neighbors by embedding cosine similarity (via FAISS,
-    see candidate_retrieval.py), bounded to +/- `--ann-max-days`, UNION
-    (optionally) RAG-based candidates from multi-query or file-boost
-    retrieval (see --rag-candidates). This recovers ground-truth pairs
-    that are textually/semantically linked but fall outside the plain time
-    window -- pass --disable-ann to fall back to the pure time-window pool
-    for comparison.
+  - Candidates for an anchor are pulled from the full dataset within a
+    +/- `window_days` window, mirroring the engine's `get_candidates`.
   - Train/test split is time-based (chronological), not random: anchors
     with created_time before the split point go to train, the rest to
     test. This matches "70% train / 30% test" via a time quantile.
@@ -56,13 +49,6 @@ Design notes / assumptions (see conversation for rationale):
     with high SBERT similarity to the anchor) with random negatives, to
     match the harder distribution the model sees at inference time.
 """
-
-import sys
-import os
-# Add project root to sys.path so 'backend' can be resolved when running this script directly
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
-sys.path.insert(0, project_root)
-sys.path.insert(0, os.path.join(project_root, 'backend'))
 
 import argparse
 import ast
@@ -77,9 +63,6 @@ import numpy as np
 import pandas as pd
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
-
-from backend.core.improved_rag_engine import ImprovedRAGEngine
-from condidate_retrieval import CandidateIndex
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 
@@ -167,7 +150,7 @@ def extract_discussion_text(row):
     return " ".join(parts)
 
 
-TICKET_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,9}-\d+|#\d{3,7})\b")
+TICKET_RE = re.compile(r"(?:\b|)([A-Z][A-Z0-9]{1,9}-\d+|#\d{3,7})(?:\b|)")
 
 
 def extract_ticket_refs(text):
@@ -288,7 +271,7 @@ def load_dataset(csv_path):
     df["change_log_parsed"] = df["change_log"].apply(safe_parse_json) if "change_log" in df.columns else [[] for _ in range(len(df))] 
     print("change_log_parsed",df["change_log_parsed"].head())
     df["comments_parsed"] = df["comments"].apply(safe_parse_json) if "comments" in df.columns else [[] for _ in range(len(df))]
-    print("comments_parsed",df["comments_parsed"].count())
+    print("comments_parsed",df["comments_parsed"].head())
     # df["reviewers"] = df.apply(extract_reviewers, axis=1)
     df["discussion_text"] = df.apply(extract_discussion_text, axis=1)
     df["has_discussion"] = df["discussion_text"].str.strip().str.len() > 0
@@ -362,70 +345,27 @@ def load_ground_truth(path, df):
 # Candidate windowing / negative sampling / group construction
 # --------------------------------------------------------------------------
 
-def report_window_coverage(df, pairs, window_days, candidate_fn=None, ann_enabled=False, rag_enabled=False):
+def report_window_coverage(df, pairs, window_days):
     """Diagnostic: how many ground-truth pairs are actually usable at this
-    window size, before we spend time building groups / training.
-    
-    If candidate_fn is provided, also reports how many pairs are recovered
-    by the hybrid candidate pool (ANN + RAG) vs pure time-window.
-    """
+    window size, before we spend time building groups / training."""
     deltas_hours = []
-    unusable_by_window = 0
+    unusable = 0
     for i, j in pairs:
         delta_h = abs((df.loc[i, "created_time"] - df.loc[j, "created_time"]).total_seconds() / 3600)
         deltas_hours.append(delta_h)
         if delta_h > window_days * 24:
-            unusable_by_window += 1
+            unusable += 1
 
     deltas_days = np.array(deltas_hours) / 24
     print(f"  pair time-deltas (days): median={np.median(deltas_days):.1f}  "
           f"p75={np.percentile(deltas_days, 75):.1f}  p90={np.percentile(deltas_days, 90):.1f}  "
           f"max={np.max(deltas_days):.1f}")
-    usable_pct = 100 * (len(pairs) - unusable_by_window) / len(pairs) if pairs else 0
-    print(f"  {len(pairs) - unusable_by_window}/{len(pairs)} pairs ({usable_pct:.1f}%) fall within "
+    usable_pct = 100 * (len(pairs) - unusable) / len(pairs) if pairs else 0
+    print(f"  {len(pairs) - unusable}/{len(pairs)} pairs ({usable_pct:.1f}%) fall within "
           f"+/-{window_days} days and will be usable for training")
-    
-    # If hybrid candidate pool is enabled, check how many additional pairs are recoverable
-    # Note: This can be slow with RAG enabled, so we show progress
-    if candidate_fn is not None and unusable_by_window > 0:
-        print(f"  Checking recovery for {unusable_by_window} out-of-window pairs (this may take a moment)...")
-        recovered_by_hybrid = 0
-        checked = 0
-        for i, j in pairs:
-            delta_h = abs((df.loc[i, "created_time"] - df.loc[j, "created_time"]).total_seconds() / 3600)
-            if delta_h > window_days * 24:
-                # This pair is outside the time window - check if it's recovered by hybrid pool
-                # Use the earlier patch as anchor
-                anchor = i if df.loc[i, "created_time"] <= df.loc[j, "created_time"] else j
-                candidate = j if anchor == i else i
-                try:
-                    candidates = candidate_fn(anchor)
-                    if candidate in candidates:
-                        recovered_by_hybrid += 1
-                except Exception as e:
-                    pass  # Skip if retrieval fails
-                checked += 1
-                if checked % 100 == 0:
-                    print(f"    ... checked {checked}/{unusable_by_window} pairs")
-        
-        if recovered_by_hybrid > 0:
-            sources = []
-            if ann_enabled:
-                sources.append("ANN")
-            if rag_enabled:
-                sources.append("RAG")
-            source_str = " + ".join(sources) if sources else "hybrid"
-            print(f"  \U0001F504 {recovered_by_hybrid}/{unusable_by_window} out-of-window pairs RECOVERED by {source_str} retrieval")
-            total_usable = len(pairs) - unusable_by_window + recovered_by_hybrid
-            print(f"  \u2705 Total usable pairs: {total_usable}/{len(pairs)} ({100*total_usable/len(pairs):.1f}%)")
-        else:
-            if unusable_by_window > 0:
-                print(f"  \u26a0\ufe0f  No additional pairs recovered by hybrid retrieval (consider increasing ann_k, rag_k, or ann_max_days)")
-    
-    if usable_pct < 70 and candidate_fn is None:
+    if usable_pct < 70:
         print(f"  \u26a0\ufe0f  over {100 - usable_pct:.0f}% of your labeled pairs are OUTSIDE the "
               f"+/-{window_days}-day window and will be silently dropped. Consider raising --window-days, "
-              f"or enable --ann / --rag-candidates to recover them, "
               f"or confirm this loss is expected (e.g. distant links genuinely shouldn't be retrievable).")
 
 
@@ -460,17 +400,14 @@ def sample_negatives(df, emb, anchor_idx, candidate_idxs, positive_idxs, max_neg
     return hard_negs + easy_negs
 
 
-def build_training_rows(df, emb, emb_disc, anchor_positive_map, candidate_fn, max_negatives, hard_ratio, seed):
-    """`candidate_fn(anchor_idx) -> list[int]` supplies the candidate pool for
-    an anchor. Pass a plain time-window function or the hybrid ANN+window
-    wrapper (get_hybrid_candidates) built in main()."""
+def build_training_rows(df, emb, emb_disc, anchor_positive_map, window_days, max_negatives, hard_ratio, seed):
     rng = np.random.default_rng(seed)
     groups = []
     for anchor_idx, positive_idxs in anchor_positive_map.items():
-        candidate_idxs = candidate_fn(anchor_idx)
+        candidate_idxs = get_candidate_indices(df, anchor_idx, window_days)
         in_window_positives = positive_idxs & set(candidate_idxs)
         if not in_window_positives:
-            continue  # the linked patch fell outside the candidate pool; not learnable for this anchor
+            continue  # the linked patch fell outside the window; not learnable for this anchor
 
         negatives = sample_negatives(df, emb, anchor_idx, candidate_idxs, positive_idxs,
                                       max_negatives, hard_ratio, rng)
@@ -526,10 +463,10 @@ def train_model(X_train, y_train, group_train, X_test, y_test, group_test, featu
     return model
 
 
-def evaluate(model, df, emb, emb_disc, anchors, candidate_fn, feature_cols, top_k, positives_by_anchor):
+def evaluate(model, df, emb, emb_disc, anchors, window_days, feature_cols, top_k, positives_by_anchor):
     reciprocal_ranks, recalls = [], []
     for anchor_idx in anchors:
-        candidate_idxs = candidate_fn(anchor_idx)
+        candidate_idxs = get_candidate_indices(df, anchor_idx, window_days)
         if not candidate_idxs:
             continue
         positive_set = positives_by_anchor.get(anchor_idx, set()) & set(candidate_idxs)
@@ -564,14 +501,6 @@ def main():
     parser.add_argument("--model-out", required=True, help="Path to save the trained model (.pkl).")
     parser.add_argument("--window-days", type=int, default=14)
     parser.add_argument("--top-k", type=int, default=5)
-    parser.add_argument("--ann-k", type=int, default=50, help="Number of ANN (embedding-similarity) neighbors to add to the candidate pool per anchor.")
-    parser.add_argument("--ann-max-days", type=int, default=90, help="Time bound applied to ANN candidates (wider than --window-days).")
-    parser.add_argument("--disable-ann", action="store_true", help="Fall back to pure time-window candidates (for A/B comparison against the hybrid pool).")
-    parser.add_argument("--ann-exact", action="store_true", help="Use exact (brute-force) FAISS search instead of HNSW. Fine for small datasets; slower to build/query at scale.")
-    parser.add_argument("--rag-candidates", action="store_true", help="Enable RAG-based candidate retrieval (multi-query/file-boost) as an additional candidate source.")
-    parser.add_argument("--rag-k", type=int, default=20, help="Number of RAG candidates to retrieve per anchor.")
-    parser.add_argument("--rag-strategy", choices=["multi_query", "file_boost"], default="multi_query", help="RAG retrieval strategy: 'multi_query' or 'file_boost'.")
-    parser.add_argument("--rag-window-days", type=int, default=30, help="Time window for RAG retrieval (typically wider than --window-days).")
     parser.add_argument("--test-size", type=float, default=0.3, help="Fraction of (time-ordered) anchors held out for testing.")
     parser.add_argument("--max-negatives", type=int, default=20, help="Max negatives sampled per training/eval group.")
     parser.add_argument("--hard-negative-ratio", type=float, default=0.6, help="Fraction of sampled negatives that are 'hard' (high SBERT similarity, unlinked).")
@@ -608,57 +537,6 @@ def main():
     print("Checking ground-truth pair coverage at this window size...")
     report_window_coverage(df, pairs, args.window_days)
 
-    # Build RAG engine if requested
-    rag_engine = None
-    if args.rag_candidates:
-        print(f"Building RAG engine for candidate retrieval (strategy={args.rag_strategy}, k={args.rag_k})...")
-        rag_engine = ImprovedRAGEngine(use_hybrid=True)
-        # Load the same dataset into RAG engine (use "train" as project key)
-        rag_engine.load_project("train", args.dataset)
-        print(f"  RAG engine initialized with {len(rag_engine.datasets.get('train', []))} patches")
-
-    if args.disable_ann and not args.rag_candidates:
-        print("ANN and RAG retrieval disabled — using pure time-window candidates.")
-        cand_index = None
-    else:
-        print(f"Building FAISS candidate index (ann_k={args.ann_k}, ann_max_days={args.ann_max_days})...")
-        cand_index = CandidateIndex.build(
-            emb, df["created_time"].to_numpy(),
-            use_hnsw=not args.ann_exact,
-            df=df,
-            rag_engine=rag_engine,
-        )
-
-    def get_hybrid_candidates(anchor_idx, window_days):
-        """Time-window candidates unioned with ANN (embedding-similarity)
-        neighbors and optionally RAG-based candidates, so ground-truth pairs
-        outside the window are still reachable at train and eval time.
-        Falls back to pure time-window candidates if both ANN and RAG are disabled."""
-        time_window_fn = lambda a: get_candidate_indices(df, a, window_days)
-        if cand_index is None:
-            return time_window_fn(anchor_idx)
-        return cand_index.get_candidates(
-            anchor_idx=anchor_idx,
-            emb=emb,
-            window_days=window_days,
-            ann_k=args.ann_k,
-            ann_max_days=args.ann_max_days,
-            time_window_fn=time_window_fn,
-            rag_k=args.rag_k if args.rag_candidates else 0,
-            rag_strategy=args.rag_strategy,
-            rag_window_days=args.rag_window_days,
-        )
-
-    # Re-run coverage diagnostic with hybrid candidate pool to show recovery
-    if cand_index is not None:
-        print("\nRe-checking coverage with hybrid candidate pool...")
-        report_window_coverage(
-            df, pairs, args.window_days,
-            candidate_fn=lambda a: get_hybrid_candidates(a, args.window_days),
-            ann_enabled=not args.disable_ann,
-            rag_enabled=args.rag_candidates,
-        )
-
     print("Assigning canonical anchor per pair (earlier-created patch)...")
     positives_by_anchor = {}
     for i, j in pairs:
@@ -674,9 +552,8 @@ def main():
     print("Building training groups (with hard-negative sampling)...")
     train_map = {a: positives_by_anchor[a] for a in train_anchors}
     test_map = {a: positives_by_anchor[a] for a in test_anchors}
-    train_candidate_fn = lambda a: get_hybrid_candidates(a, args.window_days)
-    train_groups = build_training_rows(df, emb, emb_disc, train_map, train_candidate_fn, args.max_negatives, args.hard_negative_ratio, args.seed)
-    test_groups = build_training_rows(df, emb, emb_disc, test_map, train_candidate_fn, args.max_negatives, args.hard_negative_ratio, args.seed + 1)
+    train_groups = build_training_rows(df, emb, emb_disc, train_map, args.window_days, args.max_negatives, args.hard_negative_ratio, args.seed)
+    test_groups = build_training_rows(df, emb, emb_disc, test_map, args.window_days, args.max_negatives, args.hard_negative_ratio, args.seed + 1)
 
     X_train, y_train, group_sizes_train = groups_to_frame(df, emb, emb_disc, train_groups)
     X_test, y_test, group_sizes_test = groups_to_frame(df, emb, emb_disc, test_groups)
@@ -706,7 +583,7 @@ def main():
     model = train_model(X_train, y_train, group_sizes_train, X_test, y_test, group_sizes_test,
                          feature_cols, lgb_params, args.num_boost_round, args.early_stopping_rounds)
 
-    eval_windows = [2, 7, 14, 30]
+    eval_windows = [2]
     eval_top_ks  = [1, 2, 4, 6, 8, 10]
 
     print("\n" + "=" * 60)
@@ -718,11 +595,10 @@ def main():
         header = f"  {'k':>4}  {'MRR':>8}  {'Recall@k':>10}  {'#anchors':>9}"
         print(header)
         print("  " + "-" * (len(header) - 2))
-        eval_candidate_fn = lambda a, win=win: get_hybrid_candidates(a, win)
         for k in eval_top_ks:
             mrr, recall_k, n_eval = evaluate(
                 model, df, emb, emb_disc, test_anchors,
-                eval_candidate_fn, feature_cols, k, positives_by_anchor
+                win, feature_cols, k, positives_by_anchor
             )
             print(f"  {k:>4}  {mrr:>8.4f}  {recall_k:>10.4f}  {n_eval:>9}")
 
@@ -740,9 +616,6 @@ def main():
         "eval_window_days": 2,  # Bug B fix: Save the eval window the model was validated at
         "top_k": args.top_k,
         "sbert_model_name": args.sbert_model,
-        "ann_enabled": not args.disable_ann,
-        "ann_k": args.ann_k,
-        "ann_max_days": args.ann_max_days,
     }, out_path)
     print(f"Model saved to {out_path}")
 
