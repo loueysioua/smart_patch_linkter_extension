@@ -9,6 +9,12 @@ Usage:
     
     # Evaluate specific ground truth file
     python evaluate_rag.py --project onap --ground-truth datasets/onap/ground_truth.csv
+    
+    # Use only 30% of samples for faster testing
+    python evaluate_rag.py --project onap --test-ratio 0.3 --random-seed 42
+    
+    # Use 50% of samples with improved engine
+    python evaluate_rag.py --project onap --test-ratio 0.5 --engine improved --strategy multi_query
 """
 
 import argparse
@@ -436,6 +442,8 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument("--engine", default="default", choices=["default", "improved"], help="Engine to use")
     parser.add_argument("--strategy", default="multi_query", choices=["hybrid", "file_boost", "multi_query"], help="Retrieval strategy for improved engine")
+    parser.add_argument("--test-ratio", type=float, default=1.0, help="Ratio of samples to use for testing (0.0-1.0). E.g., 0.3 uses 30%% of samples randomly selected")
+    parser.add_argument("--random-seed", type=int, default=42, help="Random seed for reproducibility when using test-ratio")
     
     args = parser.parse_args()
     
@@ -453,7 +461,7 @@ def main():
         print("\n🔧 Using Default RAG Engine")
     
     # Load project
-    csv_path = f"datasets/{args.project}/all_candidates.csv"
+    csv_path = f"data/{args.project}/all_candidates.csv"
     if not os.path.exists(csv_path):
         print(f"❌ Dataset not found: {csv_path}")
         sys.exit(1)
@@ -465,7 +473,7 @@ def main():
     if args.ground_truth:
         gt_path = args.ground_truth
     else:
-        gt_path = f"datasets/{args.project}/ground_truth.csv"
+        gt_path = f"data/{args.project}/ground_truth.csv"
     
     if not os.path.exists(gt_path):
         print(f"❌ Ground truth not found: {gt_path}")
@@ -487,6 +495,35 @@ def main():
     if len(gt_filtered) == 0:
         print("❌ No pairs within time window")
         sys.exit(1)
+    
+    # Apply test ratio sampling
+    if args.test_ratio < 1.0:
+        if args.test_ratio <= 0.0 or args.test_ratio > 1.0:
+            print(f"❌ Invalid test-ratio: {args.test_ratio}. Must be between 0.0 and 1.0")
+            sys.exit(1)
+        
+        # Set random seed for reproducibility
+        np.random.seed(args.random_seed)
+        
+        # Sample a fraction of the ground truth pairs
+        sample_size = int(len(gt_filtered) * args.test_ratio)
+        if sample_size == 0:
+            sample_size = 1  # Ensure at least 1 sample
+        
+        # Random sample
+        sample_indices = np.random.choice(
+            len(gt_filtered), 
+            size=sample_size, 
+            replace=False
+        )
+        gt_sampled = gt_filtered.iloc[sample_indices].reset_index(drop=True)
+        
+        print(f"\n🎲 Test Ratio Sampling:")
+        print(f"   Ratio: {args.test_ratio:.2%}")
+        print(f"   Random Seed: {args.random_seed}")
+        print(f"   Sampled {len(gt_sampled)} pairs from {len(gt_filtered)} total pairs")
+        
+        gt_filtered = gt_sampled
     
     # Run evaluation
     print(f"\n🔍 Running evaluation...")

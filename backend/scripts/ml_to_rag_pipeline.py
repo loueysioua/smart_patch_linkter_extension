@@ -159,7 +159,9 @@ class MLToRAGPipeline:
         else:
             print(f"\n🔧 Initializing RAG engine...")
             self.rag_engine = ImprovedRAGEngine(use_hybrid=True)
-            self.rag_engine.load_project(project, csv_path)
+            # Pass embeddings cache path to avoid recomputing
+            embeddings_cache = f"data/{project}/embeddings_cache.npy"
+            self.rag_engine.load_project(project, csv_path, embeddings_path=embeddings_cache)
         
         # Compute embeddings for ML features
         print(f"\n🧮 Computing embeddings for ML features...")
@@ -214,15 +216,22 @@ class MLToRAGPipeline:
         if os.path.exists(cache_path):
             print(f"   Loading cached embeddings from {cache_path}")
             cached = np.load(cache_path, allow_pickle=True).item()
-            if cached.get("n_rows") == len(self.df):
+            # Check if cache is valid (same model and row count)
+            if (cached.get("model_name") == self.sbert_model_name and 
+                cached.get("n_rows") == len(self.df)):
                 return cached["embeddings"]
+            print(f"   ⚠️ Cache found but stale (model or row count changed) - recomputing")
         
         texts = (self.df["title"] + " " + self.df["description"]).tolist()
         embeddings = self.sbert.encode(texts, batch_size=64, show_progress_bar=True, convert_to_numpy=True)
         
-        # Cache for future use
+        # Cache for future use with model name
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        np.save(cache_path, {"embeddings": embeddings, "n_rows": len(self.df)})
+        np.save(cache_path, {
+            "embeddings": embeddings, 
+            "n_rows": len(self.df),
+            "model_name": self.sbert_model_name
+        })
         
         return embeddings
     
@@ -242,6 +251,7 @@ class MLToRAGPipeline:
                 "discussion_embeddings" in cached):
                 print(f"   Loading cached discussion embeddings from {cache_path}")
                 return cached["discussion_embeddings"]
+            print(f"   ⚠️ Discussion embeddings not in cache or stale - computing")
         
         # Compute discussion embeddings
         print(f"   Computing discussion embeddings for {len(discussion_texts)} patches...")
@@ -258,6 +268,16 @@ class MLToRAGPipeline:
             cached["discussion_embeddings"] = discussion_embeddings
             np.save(cache_path, cached)
             print(f"   Cached discussion embeddings to {cache_path}")
+        else:
+            # Create new cache with both embeddings
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            np.save(cache_path, {
+                "embeddings": self.embeddings,
+                "discussion_embeddings": discussion_embeddings,
+                "n_rows": len(self.df),
+                "model_name": self.sbert_model_name
+            })
+            print(f"   Created new cache with discussion embeddings at {cache_path}")
         
         return discussion_embeddings
     
@@ -586,19 +606,23 @@ class MLToRAGPipeline:
                 union_candidates[cand["patch_id"]] = cand.copy()
             
             # Add RAG-only candidates with placeholder ML score
+            anchor_idx = self.id_to_idx[patch_ref["patch_id"]]
             for cand in rag_candidates:
                 pid = cand["patch_id"]
                 if pid not in union_candidates:
-                    # RAG-only candidate - assign neutral ML score
+                    cand_idx = cand.get("idx")
+                    feats = self._build_features(anchor_idx, cand_idx)
+                    X = pd.DataFrame([feats]).reindex(columns=self.feature_cols, fill_value=0)
+                    real_ml_score = float(self.model.predict(X)[0])
                     union_candidates[pid] = {
                         "patch_id": pid,
-                        "ml_score": ml_score_range[0],  # Use minimum ML score
+                        "ml_score": real_ml_score,
                         "ml_rank": None,
                         "title": cand.get("title", ""),
                         "description": cand.get("description", ""),
                         "created_time": cand.get("created_time"),
                         "files": cand.get("files", []),
-                        "idx": cand.get("idx"),
+                        "idx": cand_idx,
                         "from_rag_only": True,
                     }
             
@@ -642,6 +666,8 @@ def evaluate_pipeline(
     rag_weight: float = 0.3,
     ml_candidates_k: int = 20,
     verbose: bool = True,
+    sample_ratio: float = 1.0,
+    random_seed: int = 42,
 ):
     """Evaluate the ML → RAG pipeline on ground truth.
     
@@ -653,6 +679,8 @@ def evaluate_pipeline(
         rag_weight: Weight for RAG refinement
         ml_candidates_k: Number of ML candidates to refine
         verbose: Print detailed results
+        sample_ratio: Fraction of dataset to evaluate (0.0-1.0, default 1.0 = all)
+        random_seed: Random seed for reproducible sampling
     
     Returns:
         Dictionary with evaluation metrics
@@ -679,9 +707,23 @@ def evaluate_pipeline(
     for src, tgt in gt_pairs:
         gt_by_source[src].add(tgt)
     
+    # Sample a portion of the dataset if sample_ratio < 1.0
+    if sample_ratio < 1.0:
+        import random
+        random.seed(random_seed)
+        all_sources = list(gt_by_source.keys())
+        sample_size = max(1, int(len(all_sources) * sample_ratio))
+        sampled_sources = set(random.sample(all_sources, sample_size))
+        gt_by_source = {k: v for k, v in gt_by_source.items() if k in sampled_sources}
+        print(f"📊 Sampled {len(gt_by_source)}/{len(all_sources)} sources ({sample_ratio*100:.1f}%) with seed={random_seed}")
+    
     # Evaluate with Recall@k for k = 1, 2, 4, 6, 8, 10 (matching ML model evaluation)
     reciprocal_ranks = []
     recalls_at_k = {k: [] for k in [1, 2, 4, 6, 8, 10]}
+    
+    # Track from_rag_only hits in correct predictions
+    rag_only_correct_hits = {k: 0 for k in [1, 2, 4, 6, 8, 10]}
+    total_correct_hits = {k: 0 for k in [1, 2, 4, 6, 8, 10]}
     
     evaluated = 0
     skipped = 0
@@ -713,6 +755,9 @@ def evaluate_pipeline(
                 ml_candidates_k=ml_candidates_k,
             )
         except Exception as e:
+            print(f"   ⚠️ Error processing {source_id}: {e}")
+            import traceback
+            traceback.print_exc()
             skipped += 1
             continue
         
@@ -728,16 +773,31 @@ def evaluate_pipeline(
         reciprocal_ranks.append(rr)
         
         # Recall@k for k = 1, 2, 4, 6, 8, 10
+        query_recalls = {}
         for k in recalls_at_k.keys():
-            top_k_pred = set(predicted_ids[:k])
-            hits = len(top_k_pred & target_ids)
-            recall = hits / len(target_ids) if target_ids else 0.0
+            top_k_results = results[:k]
+            top_k_pred = set(r["patch_id"] for r in top_k_results)
+            hits = top_k_pred & target_ids
+            hits_count = len(hits)
+            recall = hits_count / len(target_ids) if target_ids else 0.0
             recalls_at_k[k].append(recall)
+            query_recalls[k] = recall
+            
+            # Track from_rag_only hits
+            if hits_count > 0:
+                total_correct_hits[k] += hits_count
+                for r in top_k_results:
+                    if r["patch_id"] in hits and r.get("from_rag_only"):
+                        rag_only_correct_hits[k] += 1
+        
+        # Print per-query recall@k
+        if verbose:
+            recall_str = " | ".join([f"@{k}:{query_recalls[k]:.2f}" for k in [1, 2, 4, 6, 8, 10]])
+            print(f"   [{source_id}] targets={len(target_ids)} | {recall_str}")
         
         evaluated += 1
-        
         if verbose and evaluated % 50 == 0:
-            print(f"   Evaluated {evaluated}/{len(gt_by_source)} queries...")
+                print(f"   Evaluated {evaluated}/{len(gt_by_source)} queries...")
     
     # Aggregate results
     mrr = np.mean(reciprocal_ranks) if reciprocal_ranks else 0.0
@@ -752,11 +812,25 @@ def evaluate_pipeline(
     for k in [1, 2, 4, 6, 8, 10]:
         print(f"   @{k}: {mean_recalls[k]:.4f}")
     
+    # Print from_rag_only diagnostic
+    print(f"\n🔍 Union Retrieval Diagnostic (from_rag_only hits in correct predictions):")
+    for k in [1, 2, 4, 6, 8, 10]:
+        total = total_correct_hits[k]
+        rag_only = rag_only_correct_hits[k]
+        pct = (rag_only / total * 100) if total > 0 else 0.0
+        print(f"   @{k}: {rag_only}/{total} correct hits from RAG-only ({pct:.1f}%)")
+    
+    if sum(rag_only_correct_hits.values()) == 0:
+        print("\n   ⚠️  WARNING: No correct hits from RAG-only candidates!")
+        print("   → Union retrieval is NOT helping. Consider signal diversification.")
+    
     return {
         "mrr": mrr,
         "recall": mean_recalls,
         "evaluated": evaluated,
         "skipped": skipped,
+        "rag_only_correct_hits": rag_only_correct_hits,
+        "total_correct_hits": total_correct_hits,
     }
 
 
@@ -828,7 +902,7 @@ def compare_approaches(
 def main():
     parser = argparse.ArgumentParser(description="Test ML → RAG Pipeline")
     parser.add_argument("--project", default="onap", help="Project name")
-    parser.add_argument("--model", default="train3/onap/model_onap_30.pkl", help="Path to ML model")
+    parser.add_argument("--model", default=None, help="Path to ML model")
     parser.add_argument("--csv", default=None, help="Path to candidates CSV")
     parser.add_argument("--patch-id", help="Specific patch ID to test")
     parser.add_argument("--evaluate", action="store_true", help="Run evaluation on ground truth")
@@ -838,6 +912,8 @@ def main():
     parser.add_argument("--top-k", type=int, default=10, help="Number of results")
     parser.add_argument("--rag-weight", type=float, default=0.3, help="RAG weight in combined score")
     parser.add_argument("--ml-candidates-k", type=int, default=20, help="ML candidates to refine")
+    parser.add_argument("--sample-ratio", type=float, default=1.0, help="Fraction of dataset to evaluate (0.0-1.0, default 1.0 = all)")
+    parser.add_argument("--random-seed", type=int, default=42, help="Random seed for reproducible sampling")
     
     args = parser.parse_args()
     
@@ -904,6 +980,8 @@ def main():
             top_k=args.top_k,
             rag_weight=args.rag_weight,
             ml_candidates_k=args.ml_candidates_k,
+            sample_ratio=args.sample_ratio,
+            random_seed=args.random_seed,
         )
     
     else:
@@ -918,6 +996,8 @@ def main():
         print(f"  python {sys.argv[0]} --project onap --patch-id <patch_id> --compare")
         print("\n  # Evaluate on ground truth:")
         print(f"  python {sys.argv[0]} --project onap --evaluate")
+        print("\n  # Evaluate on 30%% of dataset (random sample):")
+        print(f"  python {sys.argv[0]} --project onap --evaluate --sample-ratio 0.3")
         print("\n  # Custom parameters:")
         print(f"  python {sys.argv[0]} --project onap --patch-id <id> --rag-weight 0.5 --top-k 20")
         
