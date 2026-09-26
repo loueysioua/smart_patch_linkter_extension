@@ -17,13 +17,14 @@ env/
 datasets/
 models/
 data/
+train3/
 
 # ---- Logs ----
 *.log
-train_run.log
 
 # ---- FAISS / numpy caches ----
 *.index
+*.npy
 *_embeddings.npy
 
 # ---- Misc ----
