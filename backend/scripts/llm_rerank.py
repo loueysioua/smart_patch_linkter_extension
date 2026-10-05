@@ -18,7 +18,6 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import sys
@@ -41,6 +40,7 @@ except ImportError:
 
 from core.engine import SmartPatchEngine
 from core.gerrit import GerritClient
+from core.llm_rerank import rerank_candidates  # shared with the serving pipeline
 
 logging.basicConfig(
     level=logging.INFO,
@@ -81,107 +81,6 @@ def get_patch_details(
 
     logger.info("Patch %s not in dataset — fetching from Gerrit API.", patch_id)
     return GerritClient.get_patch_details(project, patch_id)
-
-
-def _strip_markdown_fences(text: str) -> str:
-    """Remove optional ````json``` / ```` ``` ```` fences from *text*."""
-    text = text.strip()
-    for fence in ("```json", "```"):
-        if text.startswith(fence):
-            text = text[len(fence):]
-            break
-    if text.endswith("```"):
-        text = text[:-3]
-    return text.strip()
-
-
-def rerank_candidates(
-    client: OpenAI,
-    target: dict[str, Any],
-    candidates: list[dict[str, Any]],
-    model_name: str = "gpt-4o-mini",
-) -> list[dict[str, Any]]:
-    """Ask an OpenAI chat model to rerank *candidates* by relevance to *target*.
-
-    Candidates that the LLM omits from its response are appended at the end in
-    their original order (fail-safe fallback).
-
-    Args:
-        client: Initialised :class:`openai.OpenAI` client.
-        target: Target patch dict (``patch_id``, ``title``, ``description``,
-                ``files``).
-        candidates: Candidate patch dicts to rerank.
-        model_name: OpenAI model identifier.
-
-    Returns:
-        Reranked list of candidate dicts.
-    """
-    if not candidates:
-        return []
-
-    candidate_block = "\n".join(
-        f"""
---- Candidate {i + 1} ---
-- **ID:** {c.get('patch_id')}
-- **Title:** {c.get('title')}
-- **Original RAG Score:** {c.get('score')}
-- **Files:** {', '.join(c.get('files', []))}
-- **Description:**
-{c.get('description', 'No description available')}
-"""
-        for i, c in enumerate(candidates)
-    )
-
-    prompt = f"""You are an expert software developer. Your task is to rerank \
-a list of candidate code changes (patches) based on their relevance to a target patch.
-The candidates are currently ranked by semantic similarity (RAG retrieval). \
-Re-evaluate and rank them from most to least relevant.
-
-### Target Patch
-- **ID:** {target.get('patch_id')}
-- **Title:** {target.get('title')}
-- **Files:** {', '.join(target.get('files', []))}
-- **Description:**
-{target.get('description')}
-
-### Candidate Patches to Rerank:
-{candidate_block}
----
-Output ONLY a valid JSON array of patch IDs ordered from most to least relevant.
-Example: ["id_2", "id_1", "id_3"]
-Do NOT include any explanation, markdown, or extra text.
-"""
-
-    logger.info("Sending %d candidates to OpenAI (%s) for reranking…", len(candidates), model_name)
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.0,
-    )
-    response_text: str = response.choices[0].message.content or ""
-
-    try:
-        json_str = _strip_markdown_fences(response_text)
-        reranked_ids: list[str] = json.loads(json_str)
-
-        if not isinstance(reranked_ids, list):
-            raise ValueError("LLM response is not a JSON array.")
-
-        id_to_cand = {c["patch_id"]: c for c in candidates}
-        reranked: list[dict[str, Any]] = []
-
-        for pid in reranked_ids:
-            if pid in id_to_cand:
-                reranked.append(id_to_cand.pop(pid))
-
-        # Append any candidates the LLM forgot
-        reranked.extend(id_to_cand.values())
-        return reranked
-
-    except (json.JSONDecodeError, ValueError) as exc:
-        logger.warning("Failed to parse LLM response (%s). Returning original ranking.", exc)
-        logger.debug("Raw LLM response: %s", response_text)
-        return candidates
 
 
 # ---------------------------------------------------------------------------

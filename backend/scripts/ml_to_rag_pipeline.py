@@ -15,6 +15,8 @@ Usage:
 
 import argparse
 import ast
+import hashlib
+import json
 import sys
 import os
 import time
@@ -32,6 +34,7 @@ backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, backend_dir)
 
 from core.improved_rag_engine import ImprovedRAGEngine
+from core.llm_rerank import rerank_candidates
 from core.utils import (
     assert_embeddings_aligned,
     build_pair_features,
@@ -82,6 +85,21 @@ class MLToRAGPipeline:
         # reranker actually contributes on an identical query set.
         self.ml_weight = 0.5
         self.rag_weight = 0.5
+
+        # --- Optional Stage 3: LLM rerank (off unless --llm-rerank is passed) ---
+        self.llm_enabled = False
+        self.llm_model = "gpt-4o-mini"
+        # How many top candidates the LLM actually sees. Independent of --top-k
+        # so the prompt size (and cost) stays fixed even when the retrieval
+        # depth changes. 0 = send everything.
+        self.llm_top_k = 10
+        self.llm_base_url = None
+        self.llm_timeout = 60.0
+        self.llm_cache_path = None
+        self.llm_cache: Dict[str, list] = {}
+        self._llm_client = None
+        self._llm_stats = {"calls": 0, "cache_hits": 0, "failures": 0, "reordered": 0}
+
         self._warned: set = set()
         self.project = project
         self.model_data = joblib.load(model_path)
@@ -504,6 +522,147 @@ class MLToRAGPipeline:
         
         return ml_candidates[:top_k]
     
+    # ------------------------------------------------------------------
+    # Stage 3 (optional): LLM rerank
+    # ------------------------------------------------------------------
+
+    def _llm_cache_key(self, patch_ref: Dict[str, Any], candidates: List[Dict[str, Any]]) -> str:
+        payload = json.dumps({
+            "model": self.llm_model,
+            "llm_top_k": self.llm_top_k,
+            "target": str(patch_ref.get("patch_id")),
+            "ids": [str(c.get("patch_id")) for c in candidates],
+        }, sort_keys=True)
+        return hashlib.sha1(payload.encode()).hexdigest()
+
+    def _llm_load_cache(self) -> None:
+        if not self.llm_cache_path or not os.path.exists(self.llm_cache_path):
+            return
+        try:
+            with open(self.llm_cache_path, encoding="utf-8") as fh:
+                self.llm_cache = json.load(fh)
+            self._log(f"   LLM cache: {len(self.llm_cache)} entries from {self.llm_cache_path}")
+        except (OSError, json.JSONDecodeError) as exc:
+            self._warn_once("llm_cache", f"   ⚠️ Could not read LLM cache ({exc}) - starting empty")
+
+    def _llm_save_cache(self) -> None:
+        if not self.llm_cache_path or not self.llm_cache:
+            return
+        out_dir = os.path.dirname(self.llm_cache_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(self.llm_cache_path, "w", encoding="utf-8") as fh:
+            json.dump(self.llm_cache, fh)
+
+    def _get_llm_client(self):
+        """Build the OpenAI-compatible client lazily.
+
+        Works against any OpenAI-compatible endpoint via ``--llm-base-url``
+        (Ollama, llama.cpp, vLLM, LM Studio), so the stage is usable without
+        internet access.
+        """
+        if self._llm_client is not None:
+            return self._llm_client
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise RuntimeError(
+                "--llm-rerank needs the 'openai' package: pip install openai"
+            )
+
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key and not self.llm_base_url:
+            raise RuntimeError(
+                "--llm-rerank needs OPENAI_API_KEY, or --llm-base-url for a local endpoint"
+            )
+
+        kwargs: Dict[str, Any] = {"api_key": api_key or "not-needed"}
+        if self.llm_base_url:
+            kwargs["base_url"] = self.llm_base_url
+        self._llm_client = OpenAI(**kwargs)
+        return self._llm_client
+
+    def predict_llm_rerank(
+        self,
+        patch_ref: Dict[str, Any],
+        candidates: List[Dict[str, Any]],
+        top_k: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """Optional Stage 3: rerank with an LLM.
+
+        Only the first ``self.llm_top_k`` candidates are sent to the model;
+        the rest keep their existing order and stay below the reranked block,
+        so the full candidate list is preserved and Recall@top_k is untouched
+        for every k.
+
+        Returns a **permutation** of *candidates*. Any failure (no key, no
+        network, bad JSON) returns the input order untouched, so the stage can
+        only ever change ranking order -- never the retrieved set.
+
+        That means Recall@top_k is mathematically invariant here, exactly as for
+        the ML+RAG blend. Only MRR and Recall@1..top_k-1 can move. To measure
+        what the LLM actually contributes, compare against ``--rag-weight 0``
+        on the same query set.
+        """
+        if not self.llm_enabled or not candidates:
+            return candidates
+
+        head_n = len(candidates) if self.llm_top_k <= 0 else min(self.llm_top_k, len(candidates))
+        head, tail = candidates[:head_n], candidates[head_n:]
+
+        cache_key = self._llm_cache_key(patch_ref, head)
+        cached_order = self.llm_cache.get(cache_key)
+        if cached_order:
+            by_id = {str(c["patch_id"]): c for c in candidates}
+            if all(pid in by_id for pid in cached_order):
+                self._llm_stats["cache_hits"] += 1
+                return [by_id[pid] for pid in cached_order] + tail
+
+        try:
+            client = self._get_llm_client()
+        except RuntimeError as exc:
+            self._llm_stats["failures"] += 1
+            self._warn_once("llm_client", f"   ⚠️ LLM stage disabled: {exc}")
+            self.llm_enabled = False
+            return candidates
+
+        target = {
+            "patch_id": patch_ref.get("patch_id"),
+            "title": patch_ref.get("title"),
+            "description": patch_ref.get("description"),
+            "files": patch_ref.get("files") or [],
+        }
+        enriched = [
+            {**c, "description": c.get("description", "")}
+            for c in head
+        ]
+
+        try:
+            reranked = rerank_candidates(
+                client, target, enriched,
+                model_name=self.llm_model,
+                timeout=self.llm_timeout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._llm_stats["failures"] += 1
+            self._warn_once(f"llm_fail_{type(exc).__name__}",
+                            f"   ⚠️ LLM rerank failed ({exc}) - keeping ML+RAG order")
+            return candidates
+
+        self._llm_stats["calls"] += 1
+        before = [str(c["patch_id"]) for c in head]
+        after = [str(c["patch_id"]) for c in reranked]
+        if before != after:
+            self._llm_stats["reordered"] += 1
+
+        # cache only the id order -- the payloads change per run
+        self.llm_cache[cache_key] = after
+        return reranked + tail
+
+    def llm_stats(self) -> Dict[str, int]:
+        """Counters for the LLM stage (call/cache/failure/reorder counts)."""
+        return dict(self._llm_stats)
+
     def predict(
         self,
         patch_ref: Dict[str, Any],
@@ -560,6 +719,15 @@ class MLToRAGPipeline:
             rag_weight=self.rag_weight,
         )
         
+        # Stage 3 (optional): LLM rerank of the blended top-k
+        if self.llm_enabled and final_results:
+            final_results = self.predict_llm_rerank(
+                patch_ref, final_results, top_k=top_k,
+            )
+            for rank, cand in enumerate(final_results, 1):
+                cand["final_rank"] = rank
+            self._log("\n🤖 LLM-Reranked Results:")
+
         self._log("\n✅ Final Results (ML → RAG blended):")
         for i, cand in enumerate(final_results, 1):
             self._log(f"   {i}. [{cand['patch_id']}]")
@@ -581,6 +749,7 @@ def evaluate_pipeline(
     random_seed: int = 42,
     details_out: str = None,
     progress_every: int = 100,
+    llm_limit: int = 0,
 ):
     """Evaluate the ML → RAG pipeline on ground truth.
 
@@ -666,6 +835,9 @@ def evaluate_pipeline(
     evaluated = 0
     skipped = 0                # source id not present in the dataset (data problem)
     skipped_out_of_window = 0  # no target reachable in ±window_days (expected filtering)
+    llm_queries = 0            # queries actually sent to the LLM
+    llm_applied = 0
+    llm_limit = llm_limit or 0
     
     for source_id, target_ids in gt_by_source.items():
         # Get source patch details
@@ -696,6 +868,12 @@ def evaluate_pipeline(
         }
         
         # Run pipeline
+        use_llm = pipeline.llm_enabled and (
+            llm_limit <= 0 or llm_queries < llm_limit
+        )
+        was_enabled = pipeline.llm_enabled
+        if not use_llm:
+            pipeline.llm_enabled = False
         try:
             # BUG #3 FIX: Use the top_k parameter passed to the function
             # (was hardcoded to 10, ignoring the parameter)
@@ -704,6 +882,7 @@ def evaluate_pipeline(
                 top_k=top_k,
                 window_days=window_days,
             )
+            llm_applied = int(pipeline.llm_enabled and was_enabled)
         except Exception as e:
             print(f"   ⚠️ Error processing {source_id}: {e}", file=sys.stderr)
             if verbose:
@@ -711,6 +890,10 @@ def evaluate_pipeline(
                 traceback.print_exc()
             skipped += 1
             continue
+        finally:
+            pipeline.llm_enabled = was_enabled
+            if llm_applied:
+                llm_queries += 1
         
         # Compute metrics against the in-window targets only
         predicted_ids = [r["patch_id"] for r in results]
@@ -742,6 +925,7 @@ def evaluate_pipeline(
             "n_targets_reachable": len(reachable),
             "reciprocal_rank": rr,
             "n_returned": len(results),
+            "llm_applied": int(llm_applied),
             **{f"recall_at_{k}": query_recalls[k] for k in query_recalls},
         })
 
@@ -780,8 +964,18 @@ def evaluate_pipeline(
     for k in [1, 2, 4, 6, 8, 10]:
         print(f"   @{k}: {mean_recalls[k]:.4f}")
 
+    if pipeline.llm_enabled or pipeline.llm_stats()["calls"]:
+        st = pipeline.llm_stats()
+        print(f"\n🤖 LLM stage ({pipeline.llm_model})")
+        print(f"   API calls: {st['calls']}  cache hits: {st['cache_hits']}  "
+              f"failures: {st['failures']}  orderings changed: {st['reordered']}")
+        print(f"   sent to LLM: {llm_queries} queries"
+              + (f" (capped by --llm-limit {llm_limit})" if llm_limit else ""))
+
     elapsed = time.perf_counter() - started_at
     print(f"\n⏱️  {elapsed/60:.1f} min total ({evaluated/max(elapsed,1e-9):.2f} q/s)")
+
+    pipeline._llm_save_cache()
 
     if details_out and detail_rows:
         out_dir = os.path.dirname(details_out)
@@ -891,6 +1085,28 @@ def main():
                         help="Weight of the ML score in the blended rerank (default 0.5)")
     parser.add_argument("--rag-weight", type=float, default=0.5,
                         help="Weight of the RAG score in the blended rerank; 0 = pure ML baseline")
+
+    llm_grp = parser.add_argument_group(
+        "LLM rerank (optional Stage 3)",
+        "Permutes the ML+RAG top-k. Cannot change which patches are retrieved, "
+        "so Recall@top_k is invariant; only ordering (MRR, Recall@1..k-1) can improve.",
+    )
+    llm_grp.add_argument("--llm-rerank", action="store_true",
+                         help="Enable the LLM rerank stage (off by default)")
+    llm_grp.add_argument("--llm-top-k", type=int, default=10,
+                         help="How many top candidates the LLM sees (default 10). "
+                              "Remaining candidates keep their order below the reranked block. 0 = all")
+    llm_grp.add_argument("--llm-model", default="gpt-4o-mini",
+                         help="Chat model id, or a local model name with --llm-base-url")
+    llm_grp.add_argument("--llm-base-url", default=None,
+                         help="OpenAI-compatible base URL (Ollama, llama.cpp, vLLM) - no API key needed")
+    llm_grp.add_argument("--llm-timeout", type=float, default=60.0,
+                         help="Per-request timeout in seconds (default: 60)")
+    llm_grp.add_argument("--llm-cache", default=None,
+                         help="JSON file caching LLM orderings so re-runs cost nothing")
+    llm_grp.add_argument("--llm-limit", type=int, default=0,
+                         help="Only send the first N evaluated queries to the LLM (0 = no limit). "
+                              "Use a small value to smoke-test before a full paid sweep.")
     
     args = parser.parse_args()
     
@@ -920,6 +1136,19 @@ def main():
     pipeline.rag_weight = args.rag_weight
     if args.ml_weight + args.rag_weight <= 0:
         sys.exit("❌ --ml-weight and --rag-weight cannot both be 0")
+
+    pipeline.llm_enabled = args.llm_rerank
+    pipeline.llm_model = args.llm_model
+    pipeline.llm_top_k = args.llm_top_k
+    pipeline.llm_base_url = args.llm_base_url
+    pipeline.llm_timeout = args.llm_timeout
+    pipeline.llm_cache_path = args.llm_cache
+    if args.llm_rerank:
+        pipeline._llm_load_cache()
+        key_state = "OPENAI_API_KEY set" if os.environ.get("OPENAI_API_KEY") else "no API key"
+        view = "all" if args.llm_top_k <= 0 else str(args.llm_top_k)
+        print(f"   LLM rerank: ON ({args.llm_model}, top-{view}, {key_state}"
+              f"{', ' + args.llm_base_url if args.llm_base_url else ''})")
     if args.evaluate:
         print(f"   per-query tracing: {'ON' if args.verbose else 'OFF'}")
     
@@ -967,6 +1196,7 @@ def main():
             random_seed=args.random_seed,
             details_out=args.details_out,
             progress_every=args.progress_every,
+            llm_limit=args.llm_limit,
         )
     
     else:
