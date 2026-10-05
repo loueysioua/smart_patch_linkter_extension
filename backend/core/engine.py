@@ -21,7 +21,12 @@ import numpy as np
 import pandas as pd
 from sentence_transformers import SentenceTransformer
 
-from core.utils import get_path_similarity_stats
+from core.utils import (
+    cache_is_valid,
+    embeddings_fingerprint,
+    get_path_similarity_stats,
+    title_desc_texts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -226,10 +231,13 @@ class SmartPatchEngine:
         logger.info("Saved FAISS index → %s", index_path)
 
         emb_path = os.path.join(output_dir, f"{project}_embeddings.npy")
+        project_df = self.datasets[project]
         np.save(emb_path, {
             "embeddings": self.embeddings[project],
-            "n_rows": len(self.datasets[project]),
+            "n_rows": len(project_df),
             "sbert_model": self._sbert_model_name,
+            "fingerprint": embeddings_fingerprint(
+                project_df["patch_id"], title_desc_texts(project_df)),
         })
         logger.info("Saved embeddings → %s", emb_path)
 
@@ -310,18 +318,22 @@ class SmartPatchEngine:
         Returns:
             Float32 embedding matrix of shape ``(len(df), embedding_dim)``.
         """
+        texts = title_desc_texts(df)
+
         if cache_path and os.path.exists(cache_path):
             logger.info("[%s] Loading cached embeddings from %s…", project_key, cache_path)
             try:
                 cached = np.load(cache_path, allow_pickle=True).item()
-                if cached.get("n_rows") == len(df):
+                if cache_is_valid(cached, df, self._sbert_model_name, texts):
                     return cached["embeddings"]
-                logger.warning("[%s] Cache row-count mismatch — recomputing.", project_key)
+                logger.warning(
+                    "[%s] Cache stale (model/rows/order/text changed) - recomputing.",
+                    project_key,
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[%s] Failed to read cache (%s) — recomputing.", project_key, exc)
 
         logger.info("[%s] Computing embeddings for %d patches…", project_key, len(df))
-        texts = (df["title"] + " " + df["description"]).tolist()
         embeddings: np.ndarray = self.sbert.encode(
             texts,
             batch_size=64,

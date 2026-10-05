@@ -27,12 +27,23 @@ from collections import Counter
 from datetime import timedelta
 from typing import Any
 
-import faiss
+try:  # faiss is only needed for the ANN index, not for scoring or reranking
+    import faiss
+    _FAISS_IMPORT_ERROR: str | None = None
+except ImportError as _exc:  # pragma: no cover - environment dependent
+    faiss = None
+    _FAISS_IMPORT_ERROR = str(_exc)
+
 import numpy as np
 import pandas as pd
 from sentence_transformers import SentenceTransformer
 
-from core.utils import get_path_similarity_stats
+from core.utils import (
+    cache_is_valid,
+    embeddings_fingerprint,
+    get_path_similarity_stats,
+    title_desc_texts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +71,7 @@ class ImprovedRAGEngine:
 
         self.datasets: dict[str, pd.DataFrame] = {}
         self.embeddings: dict[str, np.ndarray] = {}
-        self.faiss_indices: dict[str, faiss.Index] = {}
+        self.faiss_indices: dict[str, "faiss.Index"] = {}
         self.loaded_projects: list[str] = []
         self.use_hybrid = use_hybrid
 
@@ -195,6 +206,13 @@ class ImprovedRAGEngine:
         Returns:
             Sorted list of candidate dicts.
         """
+        if faiss is None:
+            logger.warning(
+                "ANN retrieval needs faiss, which is not installed (%s). "
+                "Install faiss-cpu, or use the hybrid/BM25 retrieval path.",
+                _FAISS_IMPORT_ERROR,
+            )
+            return []
         if project not in self.faiss_indices:
             return []
 
@@ -499,19 +517,23 @@ class ImprovedRAGEngine:
         cache_path: str | None,
     ) -> np.ndarray:
         """Load from cache or compute + save SBERT embeddings."""
+        texts = title_desc_texts(df)
+
         if cache_path and os.path.exists(cache_path):
             logger.info("[%s] Loading cached embeddings from %s…", project_key, cache_path)
             try:
                 cached = np.load(cache_path, allow_pickle=True).item()
-                if cached.get("n_rows") == len(df):
+                if cache_is_valid(cached, df, self._sbert_model_name, texts):
                     return cached["embeddings"]
-                logger.warning("[%s] Cache row-count mismatch — recomputing.", project_key)
+                logger.warning(
+                    "[%s] Cache stale (model/rows/order/text changed) - recomputing.",
+                    project_key,
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[%s] Failed to read cache (%s) — recomputing.", project_key, exc)
 
         logger.info("[%s] Computing embeddings for %d patches…", project_key, len(df))
         encoder = self._get_encoder()
-        texts = (df["title"] + " " + df["description"]).tolist()
         embeddings: np.ndarray = encoder.encode(
             texts, batch_size=64, show_progress_bar=True, convert_to_numpy=True
         )
@@ -524,18 +546,32 @@ class ImprovedRAGEngine:
                 "embeddings": embeddings,
                 "n_rows": len(df),
                 "sbert_model": self._sbert_model_name,
+                "fingerprint": embeddings_fingerprint(df["patch_id"], texts),
             })
             logger.info("[%s] Cached embeddings → %s", project_key, cache_path)
 
         return embeddings
 
     def _build_faiss_index(self, project_key: str, embeddings: np.ndarray) -> None:
-        """Normalise embeddings and load them into a FAISS ``IndexFlatIP``."""
+        """Normalise embeddings and load them into a FAISS ``IndexFlatIP``.
+
+        Skipped when faiss is unavailable. Everything that reads
+        ``self.embeddings`` directly -- which is what the ML -> RAG rerank path
+        does -- keeps working; only ANN retrieval over ``faiss_indices`` needs
+        the package.
+        """
+        self.embeddings[project_key] = embeddings
+        if faiss is None:
+            logger.warning(
+                "faiss not installed (%s) -- skipping ANN index for '%s'. "
+                "Semantic reranking still works; faiss_indices retrieval does not.",
+                _FAISS_IMPORT_ERROR, project_key,
+            )
+            return
         embeddings_norm = self._normalize(embeddings)
         dim = embeddings_norm.shape[1]
         index = faiss.IndexFlatIP(dim)
         index.add(embeddings_norm.astype("float32"))
-        self.embeddings[project_key] = embeddings
         self.faiss_indices[project_key] = index
 
     @staticmethod

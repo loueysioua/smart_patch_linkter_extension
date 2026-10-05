@@ -15,10 +15,9 @@ Usage:
 
 import argparse
 import ast
-import json
-import re
 import sys
 import os
+import time
 from datetime import timedelta
 from typing import Any, Dict, List
 
@@ -33,80 +32,17 @@ backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, backend_dir)
 
 from core.improved_rag_engine import ImprovedRAGEngine
-from core.utils import get_path_similarity_stats
-
-# Ticket reference regex - matches BUG-1234, #4821, etc.
-TICKET_RE = re.compile(r"(?:\b|)([A-Z][A-Z0-9]{1,9}-\d+|#\d{3,7})(?:\b|)")
-TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
-
-
-# --------------------------------------------------------------------------
-# Parsing helpers (ported from train_patch_ranker.py)
-# --------------------------------------------------------------------------
-
-def safe_parse_json(x):
-    """Parse JSON list from string."""
-    if isinstance(x, list):
-        return x
-    if x is None or (isinstance(x, float) and pd.isna(x)):
-        return []
-    if not isinstance(x, str):
-        return []
-    try:
-        parsed = json.loads(x)
-        return parsed if isinstance(parsed, list) else []
-    except json.JSONDecodeError:
-        return []
-
-
-def extract_discussion_text(row):
-    """Extract discussion text from change_log and comments entries.
-    
-    Ported from train_patch_ranker.py - pulls message text from
-    change_log_parsed and comments_parsed columns.
-    """
-    parts = []
-    for entry in (row.get("change_log_parsed") or []):
-        if isinstance(entry, dict):
-            for key in ("message", "text", "body", "comment", "description"):
-                val = entry.get(key)
-                if val:
-                    parts.append(str(val))
-                    break
-        elif isinstance(entry, str):
-            parts.append(entry)
-    for entry in (row.get("comments_parsed") or []):
-        if isinstance(entry, dict):
-            for key in ("message", "text", "body", "comment"):
-                val = entry.get(key)
-                if val:
-                    parts.append(str(val))
-                    break
-        elif isinstance(entry, str):
-            parts.append(entry)
-    return " ".join(parts)
-
-
-def extract_ticket_refs(text):
-    """Extract bug/ticket references (e.g. 'BUG-1234', '#4821') from text.
-    
-    Ported from train_patch_ranker.py - allows flagging patches that
-    reference the same ticket even if wording differs.
-    """
-    return set(m.upper() for m in TICKET_RE.findall(text or ""))
-
-
-def tokenize(text):
-    """Tokenize text for Jaccard similarity."""
-    return set(w.lower() for w in TOKEN_RE.findall(text or ""))
-
-
-def token_jaccard(text_a, text_b):
-    """Compute token Jaccard similarity between two texts."""
-    a, b = tokenize(text_a), tokenize(text_b)
-    union = a | b
-    return len(a & b) / len(union) if union else 0.0
-
+from core.utils import (
+    assert_embeddings_aligned,
+    build_pair_features,
+    cache_is_valid,
+    embeddings_fingerprint,
+    extract_discussion_text,
+    extract_ticket_refs,
+    get_path_similarity_stats,
+    safe_parse_json,
+    title_desc_texts,
+)
 
 class MLToRAGPipeline:
     """
@@ -126,6 +62,7 @@ class MLToRAGPipeline:
         project: str,
         csv_path: str,
         rag_engine: ImprovedRAGEngine = None,
+        verbose: bool = True,
     ):
         """Initialize the pipeline.
         
@@ -134,7 +71,18 @@ class MLToRAGPipeline:
             project: Project name
             csv_path: Path to candidate CSV
             rag_engine: Optional pre-loaded RAG engine
+            verbose: Print per-query progress. Turn OFF for batch evaluation --
+                a full ground-truth sweep calls predict() thousands of times and
+                the per-query trace is ~17 lines each (~60k lines). Startup
+                messages and warnings are always shown.
         """
+        self.verbose = verbose
+        # Blend weights for the RAG refine stage. rag_weight=0 makes the final
+        # ranking pure ML, which is the baseline for measuring what the
+        # reranker actually contributes on an identical query set.
+        self.ml_weight = 0.5
+        self.rag_weight = 0.5
+        self._warned: set = set()
         self.project = project
         self.model_data = joblib.load(model_path)
         self.model = self.model_data["model"]
@@ -148,33 +96,70 @@ class MLToRAGPipeline:
         print(f"   Eval window: ±{self.eval_window_days} days (recommended for inference)")
         print(f"   Features: {len(self.feature_cols)}")
         
-        # Load dataset
-        print(f"\n📂 Loading dataset for {project}...")
-        self.df = self._load_dataset(csv_path)
-        print(f"   Loaded {len(self.df)} patches")
-        
         # Load or use provided RAG engine
         if rag_engine:
             self.rag_engine = rag_engine
         else:
-            print(f"\n🔧 Initializing RAG engine...")
+            print(f"\n� Initializing RAG engine...")
             self.rag_engine = ImprovedRAGEngine(use_hybrid=True)
             # Pass embeddings cache path to avoid recomputing
             embeddings_cache = f"data/{project}/embeddings_cache.npy"
             self.rag_engine.load_project(project, csv_path, embeddings_path=embeddings_cache)
         
-        # Compute embeddings for ML features
+        # BUG #1 FIX: Reuse rag_engine's dataset to avoid index misalignment
+        # The RAG engine has already loaded the CSV and computed embeddings in a 
+        # consistent order. Reusing its dataframe ensures self.df row indices 
+        # align with self.rag_engine.embeddings indices.
+        if project in self.rag_engine.datasets:
+            print(f"\n� Reusing RAG engine's dataset for {project} (consistent ordering)...")
+            self.df = self.rag_engine.datasets[project].copy()
+            # Add the extra columns needed by ML pipeline that RAG engine doesn't set
+            self.df["change_log_parsed"] = self.df["change_log"].apply(safe_parse_json) if "change_log" in self.df.columns else [[] for _ in range(len(self.df))]
+            self.df["comments_parsed"] = self.df["comments"].apply(safe_parse_json) if "comments" in self.df.columns else [[] for _ in range(len(self.df))]
+            self.df["discussion_text"] = self.df.apply(extract_discussion_text, axis=1)
+            self.df["has_discussion"] = self.df["discussion_text"].str.strip().str.len() > 0
+            self.df["ticket_refs"] = (self.df["title"] + " " + self.df["description"] + " " + self.df["discussion_text"]).apply(extract_ticket_refs)
+            print(f"   Loaded {len(self.df)} patches")
+        else:
+            # Fallback: load independently (should not happen in normal flow)
+            print(f"\n⚠️ RAG engine dataset not available, loading independently...")
+            self.df = self._load_dataset(csv_path)
+            print(f"   Loaded {len(self.df)} patches")
+        
+        # Compute embeddings for ML features (these are separate from RAG engine's embeddings)
         print(f"\n🧮 Computing embeddings for ML features...")
         self.sbert = SentenceTransformer(self.sbert_model_name)
         self.embeddings = self._compute_embeddings()
         self.discussion_embeddings = self._compute_discussion_embeddings()
+        assert_embeddings_aligned(self.df, self.embeddings, "title/description embeddings")
+        assert_embeddings_aligned(self.df, self.discussion_embeddings, "discussion embeddings")
         print(f"   Done!")
         
         # Build patch_id to index mapping
         self.id_to_idx = {str(pid): i for i, pid in enumerate(self.df["patch_id"])}
     
+    def _log(self, msg: str = "") -> None:
+        """Print only in verbose mode (per-query tracing)."""
+        if self.verbose:
+            print(msg)
+
+    def _warn_once(self, key: str, msg: str) -> None:
+        """Print a warning the first time it occurs, regardless of verbosity.
+
+        Startup/config problems must stay visible when quiet, otherwise the run
+        completes with plausible-looking but wrong numbers.
+        """
+        if key not in self._warned:
+            self._warned.add(key)
+            print(msg)
+
     def _load_dataset(self, csv_path: str) -> pd.DataFrame:
-        """Load and preprocess dataset."""
+        """Load and preprocess dataset.
+        
+        NOTE: This method is now deprecated - the pipeline reuses rag_engine.datasets
+        to avoid index misalignment bugs. The dataframe ordering must match the 
+        embeddings array indices.
+        """
         import ast
         
         def safe_parse_list(x):
@@ -205,34 +190,39 @@ class MLToRAGPipeline:
         # Extract ticket references from title + description + discussion
         df["ticket_refs"] = (df["title"] + " " + df["description"] + " " + df["discussion_text"]).apply(extract_ticket_refs)
         
-        df = df.sort_values("created_time").reset_index(drop=True)
+        # BUG #1 FIX: Do NOT sort by created_time here!
+        # The RAG engine loads the CSV without sorting, and embeddings are computed
+        # in that order. Sorting here creates index misalignment between self.df
+        # and self.rag_engine.embeddings, causing wrong embeddings to be retrieved.
+        # The RAG engine's dataset ordering is the source of truth for embeddings.
         
         return df
     
     def _compute_embeddings(self) -> np.ndarray:
         """Compute or load cached embeddings."""
         cache_path = f"data/{self.project}/embeddings_cache.npy"
-        
+        texts = title_desc_texts(self.df)
+
         if os.path.exists(cache_path):
             print(f"   Loading cached embeddings from {cache_path}")
             cached = np.load(cache_path, allow_pickle=True).item()
-            # Check if cache is valid (same model and row count)
-            if (cached.get("model_name") == self.sbert_model_name and 
-                cached.get("n_rows") == len(self.df)):
+            if cache_is_valid(cached, self.df, self.sbert_model_name, texts):
+                print("   Cache valid (model/rows/order/text match)")
                 return cached["embeddings"]
-            print(f"   ⚠️ Cache found but stale (model or row count changed) - recomputing")
-        
-        texts = (self.df["title"] + " " + self.df["description"]).tolist()
+            print(f"   ⚠️ Cache stale (model/rows/order/text changed) - recomputing")
+
         embeddings = self.sbert.encode(texts, batch_size=64, show_progress_bar=True, convert_to_numpy=True)
-        
-        # Cache for future use with model name
+
+        # Cache for future use, fingerprinted so a reordered dataframe can never
+        # silently reuse it (see core.utils.cache_is_valid).
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         np.save(cache_path, {
-            "embeddings": embeddings, 
+            "embeddings": embeddings,
             "n_rows": len(self.df),
-            "model_name": self.sbert_model_name
+            "model_name": self.sbert_model_name,
+            "fingerprint": embeddings_fingerprint(self.df["patch_id"], texts),
         })
-        
+
         return embeddings
     
     def _compute_discussion_embeddings(self) -> np.ndarray:
@@ -246,9 +236,9 @@ class MLToRAGPipeline:
         cache_path = f"data/{self.project}/embeddings_cache.npy"
         if os.path.exists(cache_path):
             cached = np.load(cache_path, allow_pickle=True).item()
-            if (cached.get("model_name") == self.sbert_model_name and 
-                cached.get("n_rows") == len(self.df) and
-                "discussion_embeddings" in cached):
+            if ("discussion_embeddings" in cached
+                    and cached.get("discussion_fingerprint")
+                    == embeddings_fingerprint(self.df["patch_id"], discussion_texts)):
                 print(f"   Loading cached discussion embeddings from {cache_path}")
                 return cached["discussion_embeddings"]
             print(f"   ⚠️ Discussion embeddings not in cache or stale - computing")
@@ -266,6 +256,8 @@ class MLToRAGPipeline:
         if os.path.exists(cache_path):
             cached = np.load(cache_path, allow_pickle=True).item()
             cached["discussion_embeddings"] = discussion_embeddings
+            cached["discussion_fingerprint"] = embeddings_fingerprint(
+                self.df["patch_id"], discussion_texts)
             np.save(cache_path, cached)
             print(f"   Cached discussion embeddings to {cache_path}")
         else:
@@ -275,7 +267,11 @@ class MLToRAGPipeline:
                 "embeddings": self.embeddings,
                 "discussion_embeddings": discussion_embeddings,
                 "n_rows": len(self.df),
-                "model_name": self.sbert_model_name
+                "model_name": self.sbert_model_name,
+                "fingerprint": embeddings_fingerprint(
+                    self.df["patch_id"], title_desc_texts(self.df)),
+                "discussion_fingerprint": embeddings_fingerprint(
+                    self.df["patch_id"], discussion_texts),
             })
             print(f"   Created new cache with discussion embeddings at {cache_path}")
         
@@ -294,69 +290,17 @@ class MLToRAGPipeline:
     
     def _build_features(self, anchor_idx: int, candidate_idx: int) -> Dict[str, float]:
         """Build pairwise features for ML model.
-        
-        Bug A fix: Now computes real discussion and ticket features instead of placeholders.
+
+        Delegates to core.utils.build_pair_features -- the SAME function the
+        trainer used. Do not reimplement features here: a feature present in
+        the saved model but missing here is silently zero-filled by
+        reindex(fill_value=0), which is how 4 of 17 features died last time.
         """
-        row_i = self.df.iloc[anchor_idx]
-        row_j = self.df.iloc[candidate_idx]
-        
-        # Semantic similarity
-        sim_cosine = float(cosine_similarity(
-            self.embeddings[anchor_idx].reshape(1, -1),
-            self.embeddings[candidate_idx].reshape(1, -1)
-        )[0][0])
-        
-        # File similarity
-        file_stats = get_path_similarity_stats(
-            row_i["files_parsed"],
-            row_j["files_parsed"]
+        return build_pair_features(
+            self.df, self.embeddings, self.discussion_embeddings,
+            anchor_idx, candidate_idx,
         )
-        
-        # Text similarity
-        text_i = f"{row_i['title']} {row_i['description']}"
-        text_j = f"{row_j['title']} {row_j['description']}"
-        token_jaccard_val = token_jaccard(text_i, text_j)
-        
-        # Time delta
-        delta_time_hours = abs(
-            (row_i["created_time"] - row_j["created_time"]).total_seconds() / 3600
-        )
-        
-        # Discussion similarity (Bug A fix: proper has_discussion gating)
-        has_disc_i = bool(row_i.get("has_discussion"))
-        has_disc_j = bool(row_j.get("has_discussion"))
-        
-        if has_disc_i and has_disc_j:
-            sim_cosine_discussion = float(cosine_similarity(
-                self.discussion_embeddings[anchor_idx].reshape(1, -1),
-                self.discussion_embeddings[candidate_idx].reshape(1, -1)
-            )[0][0])
-            token_jaccard_discussion = token_jaccard(
-                row_i["discussion_text"], 
-                row_j["discussion_text"]
-            )
-        else:
-            sim_cosine_discussion = 0.0
-            token_jaccard_discussion = 0.0
-        
-        # Ticket reference sharing (Bug A fix: real ticket matching)
-        ticket_refs_i = row_i.get("ticket_refs", set())
-        ticket_refs_j = row_j.get("ticket_refs", set())
-        shares_ticket_ref = float(bool(ticket_refs_i & ticket_refs_j))
-        
-        features = {
-            **file_stats,
-            "sim_cosine": sim_cosine,
-            "token_jaccard": token_jaccard_val,
-            "delta_time_hours": delta_time_hours,
-            "sim_cosine_discussion": sim_cosine_discussion,
-            "token_jaccard_discussion": token_jaccard_discussion,
-            "has_discussion_both": float(has_disc_i and has_disc_j),
-            "shares_ticket_ref": shares_ticket_ref,
-        }
-        
-        return features
-    
+
     def predict_ml_stage(
         self,
         patch_ref: Dict[str, Any],
@@ -382,7 +326,7 @@ class MLToRAGPipeline:
         # Find anchor index
         patch_id = patch_ref["patch_id"]
         if patch_id not in self.id_to_idx:
-            print(f"⚠️ Patch {patch_id} not found in dataset")
+            self._log(f"⚠️ Patch {patch_id} not found in dataset")
             return []
         
         anchor_idx = self.id_to_idx[patch_id]
@@ -391,10 +335,10 @@ class MLToRAGPipeline:
         candidate_idxs = self._get_time_window_candidates(anchor_idx, window_days)
         
         if not candidate_idxs:
-            print(f"⚠️ No candidates within ±{window_days} days")
+            self._log(f"⚠️ No candidates within ±{window_days} days")
             return []
         
-        print(f"   ML Stage: {len(candidate_idxs)} candidates in time window")
+        self._log(f"   ML Stage: {len(candidate_idxs)} candidates in time window")
         
         # Build features for all candidates
         features_list = []
@@ -403,6 +347,16 @@ class MLToRAGPipeline:
             features_list.append(feats)
         
         X = pd.DataFrame(features_list)
+        # reindex(fill_value=0) would silently zero-fill any feature the model
+        # expects but this pipeline does not compute -- that is a train/serve
+        # skew bug, not a missing value. Fail loudly instead.
+        missing = [c for c in self.feature_cols if c not in X.columns]
+        if missing:
+            raise ValueError(
+                f"Model expects {len(missing)} feature(s) this pipeline does not "
+                f"compute: {missing}. Fix core.utils.build_pair_features (shared "
+                f"with training) or retrain the model."
+            )
         X = X.reindex(columns=self.feature_cols, fill_value=0)
         
         # ML model predictions
@@ -442,57 +396,65 @@ class MLToRAGPipeline:
         patch_ref: Dict[str, Any],
         ml_candidates: List[Dict[str, Any]],
         top_k: int = 5,
-        rag_weight: float = 0.3,
-        ml_score_range: tuple = None,
+        ml_weight: float = 0.5,
+        rag_weight: float = 0.5,
     ) -> List[Dict[str, Any]]:
-        """Stage 2: RAG refinement of ML candidates.
+        """Stage 2: RAG reranking of ML candidates.
+        
+        RAG independently scores candidates, then blends with ML scores.
+        
+        BUG #2 FIX: Now blends ML and RAG scores instead of overriding ML ranking.
+        This preserves the learned signals from the ML model (ticket refs, discussion
+        similarity, time delta, author/reviewer overlap) while incorporating RAG's
+        semantic and file-overlap signals.
         
         Args:
             patch_ref: Query patch dict
             ml_candidates: Candidates from ML stage
             top_k: Final number of results
-            rag_weight: Weight for RAG score (0.0-1.0)
-            ml_score_range: Optional (min, max) tuple for global ML score normalization
+            ml_weight: Weight for ML score in final ranking (default 0.5)
+            rag_weight: Weight for RAG score in final ranking (default 0.5)
         
         Returns:
-            Reranked candidates with combined scores
+            Reranked candidates by combined ML+RAG score
         """
         if not ml_candidates:
             return []
         
-        print(f"   RAG Stage: Refining top {len(ml_candidates)} ML candidates")
+        self._log(f"   RAG Stage: Reranking top {len(ml_candidates)} ML candidates")
         
-        # Issue 4 fix: Use global score range if provided, otherwise fall back to local
-        if ml_score_range:
-            ml_min, ml_max = ml_score_range
-        else:
-            ml_scores = [cand["ml_score"] for cand in ml_candidates]
-            ml_min = min(ml_scores)
-            ml_max = max(ml_scores)
-        ml_range = ml_max - ml_min if ml_max > ml_min else 1.0
-        
-        # Issue 3 fix: Encode query once and look up candidate embeddings by index
+        # Encode query once
         query_text = f"{patch_ref.get('title', '')} {patch_ref.get('description', '')}"
         encoder = self.rag_engine._get_encoder()
         query_emb = encoder.encode([query_text], convert_to_numpy=True)
-        query_emb = query_emb / np.linalg.norm(query_emb)  # Normalize for cosine similarity
+        query_emb = query_emb / np.linalg.norm(query_emb)
         
-        # Get project embeddings (pre-computed)
+        # Get project embeddings
         project = self.project
         if project not in self.rag_engine.embeddings:
-            print(f"   ⚠️ No pre-computed embeddings for {project}, falling back to per-candidate encoding")
+            self._warn_once(
+                f"no_embeddings_{project}",
+                f"   ⚠️ No pre-computed embeddings for {project}",
+            )
             project_embeddings = None
         else:
             project_embeddings = self.rag_engine.embeddings[project]
         
-        # Get RAG scores for each candidate
+        # BUG #1 FIX: Build patch_id → index mapping for RAG engine's embeddings
+        # This ensures we look up embeddings by patch_id rather than assuming
+        # indices align across independently-ordered dataframes.
+        rag_id_to_idx = {}
+        if project in self.rag_engine.datasets:
+            rag_df = self.rag_engine.datasets[project]
+            rag_id_to_idx = {str(pid): i for i, pid in enumerate(rag_df["patch_id"])}
+        
+        # RAG scores each candidate independently
         for cand in ml_candidates:
-            # Normalize ML score to [0, 1] using global range
-            normalized_ml_score = (cand["ml_score"] - ml_min) / ml_range
-            cand["ml_score_normalized"] = normalized_ml_score
+            # Get semantic score
+            # BUG #1 FIX: Look up embedding by patch_id, not by index
+            cand_patch_id = cand.get("patch_id")
+            cand_idx = rag_id_to_idx.get(cand_patch_id) if rag_id_to_idx else None
             
-            # Issue 3 fix: Look up candidate embedding by index instead of re-encoding
-            cand_idx = cand.get("idx")
             if project_embeddings is not None and cand_idx is not None and cand_idx < len(project_embeddings):
                 cand_emb = project_embeddings[cand_idx]
                 cand_emb_norm = cand_emb / np.linalg.norm(cand_emb)
@@ -510,21 +472,31 @@ class MLToRAGPipeline:
             )
             file_score = file_stats.get("jaccard", 0.0)
             
-            # Combined RAG score (70% semantic + 30% file)
-            rag_score = 0.7 * semantic_score + 0.3 * file_score
-            
+            # RAG score (70% semantic + 30% file)
             cand["rag_semantic"] = semantic_score
             cand["rag_file"] = file_score
-            cand["rag_score"] = rag_score
-            
-            # Combined score: normalized ML + RAG
-            cand["combined_score"] = (
-                (1 - rag_weight) * normalized_ml_score +
-                rag_weight * rag_score
-            )
+            cand["rag_score"] = 0.7 * semantic_score + 0.3 * file_score
         
-        # Rerank by combined score
-        ml_candidates.sort(key=lambda x: x["combined_score"], reverse=True)
+        # BUG #2 FIX: Normalize ML scores for blending
+        # ML scores can have arbitrary range, so normalize to [0, 1] before blending
+        ml_scores = [c["ml_score"] for c in ml_candidates]
+        ml_min, ml_max = min(ml_scores), max(ml_scores)
+        ml_range = ml_max - ml_min if ml_max > ml_min else 1.0
+        
+        rag_scores = [c["rag_score"] for c in ml_candidates]
+        rag_min, rag_max = min(rag_scores), max(rag_scores)
+        rag_range = rag_max - rag_min if rag_max > rag_min else 1.0
+        
+        # Compute blended score
+        for cand in ml_candidates:
+            norm_ml = (cand["ml_score"] - ml_min) / ml_range
+            norm_rag = (cand["rag_score"] - rag_min) / rag_range
+            cand["blended_score"] = ml_weight * norm_ml + rag_weight * norm_rag
+            cand["norm_ml_score"] = norm_ml
+            cand["norm_rag_score"] = norm_rag
+        
+        # Rerank by blended score (BUG #2 FIX: was sorting by rag_score only)
+        ml_candidates.sort(key=lambda x: x["blended_score"], reverse=True)
         
         # Add final ranks
         for i, cand in enumerate(ml_candidates[:top_k], 1):
@@ -535,125 +507,66 @@ class MLToRAGPipeline:
     def predict(
         self,
         patch_ref: Dict[str, Any],
-        top_k: int = 5,
+        top_k: int = 10,
         window_days: int = None,
-        rag_weight: float = 0.3,
-        ml_candidates_k: int = 20,
-        use_union_retrieval: bool = True,
     ) -> List[Dict[str, Any]]:
         """Full ML → RAG pipeline prediction.
+        
+        ML retrieves top-k candidates, then RAG reranks them using its own scoring.
         
         Args:
             patch_ref: Query patch dict
             top_k: Final number of results
             window_days: Time window for candidates (defaults to self.window_days)
-            rag_weight: Weight for RAG refinement (0.0 = pure ML, 1.0 = pure RAG)
-            ml_candidates_k: Number of ML candidates to refine
-            use_union_retrieval: If True, merge ML and RAG candidates (Issue 2 fix)
         
         Returns:
-            Final ranked candidates
+            Final ranked candidates by RAG score
         """
-        print(f"\n🔍 ML → RAG Pipeline for patch {patch_ref['patch_id']}")
-        print(f"   Title: {patch_ref.get('title', '')[:60]}...")
+        self._log(f"\n🔍 ML → RAG Pipeline for patch {patch_ref['patch_id']}")
+        self._log(f"   Title: {patch_ref.get('title', '')[:60]}...")
         
-        # Issue 1 fix: Use consistent window_days across all paths
         window_days = window_days or self.window_days
         
-        # Stage 1: ML prediction - get all candidates with scores for global normalization
-        print(f"\n📊 Stage 1: ML Model Prediction (window=±{window_days} days)...")
+        # Stage 1: ML prediction
+        self._log(f"\n📊 Stage 1: ML Model Prediction (window=±{window_days} days)...")
         ml_candidates_all = self.predict_ml_stage(
             patch_ref,
-            top_k=len(self.df),  # Get all candidates for global normalization
+            top_k=len(self.df),
             window_days=window_days,
         )
         
         if not ml_candidates_all:
             return []
         
-        # Compute global ML score range for stable normalization (Issue 4 fix)
+        # Compute global ML score range for normalization
         all_ml_scores = [cand["ml_score"] for cand in ml_candidates_all]
         ml_score_range = (min(all_ml_scores), max(all_ml_scores))
         
         # Take top-k for refinement
-        ml_candidates = ml_candidates_all[:ml_candidates_k]
+        ml_candidates = ml_candidates_all[:top_k]
         
-        print(f"   Top 5 ML candidates:")
+        self._log("   Top 5 ML candidates:")
         for i, cand in enumerate(ml_candidates[:5], 1):
-            print(f"      {i}. [{cand['patch_id']}] ML Score: {cand['ml_score']:.4f}")
-            print(f"         {cand['title'][:60]}...")
+            self._log(f"      {i}. [{cand['patch_id']}] ML Score: {cand['ml_score']:.4f}")
+            self._log(f"         {cand['title'][:60]}...")
         
-        # Issue 2 fix: Union retrieval - RAG can reintroduce candidates ML missed
-        if use_union_retrieval:
-            print(f"\n🔗 Stage 2: Union Retrieval (ML + RAG candidates)...")
-            rag_candidates = self.rag_engine.retrieve_multi_query(
-                project=self.project,
-                patch_ref=patch_ref,
-                top_k=ml_candidates_k,
-                time_window_days=window_days,
-            )
-            
-            # Merge by patch_id
-            ml_ids = {cand["patch_id"] for cand in ml_candidates}
-            rag_ids = {cand["patch_id"] for cand in rag_candidates}
-            union_ids = ml_ids | rag_ids
-            
-            # Build unified candidate list
-            union_candidates = {}
-            
-            # Add ML candidates
-            for cand in ml_candidates:
-                union_candidates[cand["patch_id"]] = cand.copy()
-            
-            # Add RAG-only candidates with placeholder ML score
-            anchor_idx = self.id_to_idx[patch_ref["patch_id"]]
-            for cand in rag_candidates:
-                pid = cand["patch_id"]
-                if pid not in union_candidates:
-                    cand_idx = cand.get("idx")
-                    feats = self._build_features(anchor_idx, cand_idx)
-                    X = pd.DataFrame([feats]).reindex(columns=self.feature_cols, fill_value=0)
-                    real_ml_score = float(self.model.predict(X)[0])
-                    union_candidates[pid] = {
-                        "patch_id": pid,
-                        "ml_score": real_ml_score,
-                        "ml_rank": None,
-                        "title": cand.get("title", ""),
-                        "description": cand.get("description", ""),
-                        "created_time": cand.get("created_time"),
-                        "files": cand.get("files", []),
-                        "idx": cand_idx,
-                        "from_rag_only": True,
-                    }
-            
-            print(f"   ML candidates: {len(ml_ids)}")
-            print(f"   RAG candidates: {len(rag_ids)}")
-            print(f"   Union: {len(union_ids)} (RAG added {len(rag_ids - ml_ids)} unique)")
-            
-            candidates_for_refinement = list(union_candidates.values())
-        else:
-            candidates_for_refinement = ml_candidates
-        
-        # Stage 3: RAG refinement
-        print(f"\n🎯 Stage 3: RAG Refinement (weight={rag_weight})...")
+        # Stage 2: RAG refinement
+        self._log("\n🎯 Stage 2: RAG Reranking...")
         final_results = self.predict_rag_refine(
             patch_ref,
-            candidates_for_refinement,
+            ml_candidates,
             top_k=top_k,
-            rag_weight=rag_weight,
-            ml_score_range=ml_score_range,
+            ml_weight=self.ml_weight,
+            rag_weight=self.rag_weight,
         )
         
-        print(f"\n✅ Final Results (ML → RAG):")
+        self._log("\n✅ Final Results (ML → RAG blended):")
         for i, cand in enumerate(final_results, 1):
-            source = "RAG-only" if cand.get("from_rag_only") else "ML"
-            print(f"   {i}. [{cand['patch_id']}] ({source})")
-            print(f"      Combined: {cand['combined_score']:.4f}")
-            if cand.get("ml_rank"):
-                print(f"      ML: {cand['ml_score']:.4f} (rank {cand['ml_rank']}) | RAG: {cand['rag_score']:.4f}")
-            else:
-                print(f"      ML: N/A (RAG-only) | RAG: {cand['rag_score']:.4f}")
-            print(f"      {cand['title'][:60]}...")
+            self._log(f"   {i}. [{cand['patch_id']}]")
+            self._log(f"      Blended: {cand['blended_score']:.4f} (ML: {cand['norm_ml_score']:.4f}, RAG: {cand['norm_rag_score']:.4f})")
+            self._log(f"      RAG: {cand['rag_score']:.4f} (semantic: {cand['rag_semantic']:.4f}, file: {cand['rag_file']:.4f})")
+            self._log(f"      ML: {cand['ml_score']:.4f} (original rank {cand['ml_rank']})")
+            self._log(f"      {cand['title'][:60]}...")
         
         return final_results
 
@@ -663,24 +576,45 @@ def evaluate_pipeline(
     ground_truth_path: str,
     window_days: int = 14,
     top_k: int = 10,
-    rag_weight: float = 0.3,
-    ml_candidates_k: int = 20,
-    verbose: bool = True,
+    verbose: bool = False,
     sample_ratio: float = 1.0,
     random_seed: int = 42,
+    details_out: str = None,
+    progress_every: int = 100,
 ):
     """Evaluate the ML → RAG pipeline on ground truth.
-    
+
+    Quiet by default: this sweeps every ground-truth source, so per-query
+    tracing produces ~17 lines per query (tens of thousands of lines). You get
+    a progress line with running MRR, throughput and ETA instead. Pass
+    ``details_out`` to keep the per-query numbers as CSV for later analysis.
+
+    Reachability: a ground-truth target that falls OUTSIDE ``±window_days`` of
+    its source cannot be retrieved, so scoring such a query as a miss would
+    measure the window, not the model. Targets are therefore filtered to those
+    inside the window, and sources left with none are excluded from the
+    population entirely. This matches the trainer's convention in
+    ``core/train_patch_ranker.py``::
+
+        positive_set = positives_by_anchor[anchor] & set(candidate_idxs)
+        if not positive_set:
+            continue
+        recall = hits / len(positive_set)
+
+    so the two Recall@k figures are directly comparable. On the onap dataset
+    that is 1776 of 3512 sources at ±2 days -- without this filter the ±2d
+    Recall@10 is capped at 0.5057 no matter how good the ranking is.
+
     Args:
         pipeline: MLToRAGPipeline instance
         ground_truth_path: Path to ground truth CSV
-        window_days: Time window for candidates
+        window_days: Time window for candidates, and the reachability bound
         top_k: Number of results to evaluate
-        rag_weight: Weight for RAG refinement
-        ml_candidates_k: Number of ML candidates to refine
-        verbose: Print detailed results
+        verbose: Print one line per query (debugging small samples only)
         sample_ratio: Fraction of dataset to evaluate (0.0-1.0, default 1.0 = all)
         random_seed: Random seed for reproducible sampling
+        details_out: Optional CSV path for per-query rows
+        progress_every: Queries between progress lines
     
     Returns:
         Dictionary with evaluation metrics
@@ -717,23 +651,39 @@ def evaluate_pipeline(
         gt_by_source = {k: v for k, v in gt_by_source.items() if k in sampled_sources}
         print(f"📊 Sampled {len(gt_by_source)}/{len(all_sources)} sources ({sample_ratio*100:.1f}%) with seed={random_seed}")
     
-    # Evaluate with Recall@k for k = 1, 2, 4, 6, 8, 10 (matching ML model evaluation)
+    # patch_id -> created_time, for the reachability filter
+    created_lookup = dict(zip(pipeline.df["patch_id"], pipeline.df["created_time"]))
+    window_span = timedelta(days=window_days)
+
+    # Evaluate with Recall@k for k = 1, 2, 4, 6, 8, 10
     reciprocal_ranks = []
     recalls_at_k = {k: [] for k in [1, 2, 4, 6, 8, 10]}
-    
-    # Track from_rag_only hits in correct predictions
-    rag_only_correct_hits = {k: 0 for k in [1, 2, 4, 6, 8, 10]}
-    total_correct_hits = {k: 0 for k in [1, 2, 4, 6, 8, 10]}
-    
+    detail_rows = []
+
+    total_queries = len(gt_by_source)
+    started_at = time.perf_counter()
+
     evaluated = 0
-    skipped = 0
+    skipped = 0                # source id not present in the dataset (data problem)
+    skipped_out_of_window = 0  # no target reachable in ±window_days (expected filtering)
     
     for source_id, target_ids in gt_by_source.items():
         # Get source patch details
         if source_id not in pipeline.id_to_idx:
             skipped += 1
             continue
-        
+
+        # Keep only targets inside the window; drop the query if none survive.
+        source_time = created_lookup.get(source_id)
+        reachable = {
+            t for t in target_ids
+            if t in created_lookup
+            and abs((created_lookup[t] - source_time)) <= window_span
+        }
+        if not reachable:
+            skipped_out_of_window += 1
+            continue
+
         source_idx = pipeline.id_to_idx[source_id]
         row = pipeline.df.iloc[source_idx]
         
@@ -747,27 +697,28 @@ def evaluate_pipeline(
         
         # Run pipeline
         try:
+            # BUG #3 FIX: Use the top_k parameter passed to the function
+            # (was hardcoded to 10, ignoring the parameter)
             results = pipeline.predict(
                 patch_ref,
-                top_k=10,  # Always get top 10 for evaluation
+                top_k=top_k,
                 window_days=window_days,
-                rag_weight=rag_weight,
-                ml_candidates_k=ml_candidates_k,
             )
         except Exception as e:
-            print(f"   ⚠️ Error processing {source_id}: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"   ⚠️ Error processing {source_id}: {e}", file=sys.stderr)
+            if verbose:
+                import traceback
+                traceback.print_exc()
             skipped += 1
             continue
         
-        # Compute metrics
+        # Compute metrics against the in-window targets only
         predicted_ids = [r["patch_id"] for r in results]
         
         # MRR
         rr = 0.0
         for rank, pid in enumerate(predicted_ids, 1):
-            if pid in target_ids:
+            if pid in reachable:
                 rr = 1.0 / rank
                 break
         reciprocal_ranks.append(rr)
@@ -775,29 +726,34 @@ def evaluate_pipeline(
         # Recall@k for k = 1, 2, 4, 6, 8, 10
         query_recalls = {}
         for k in recalls_at_k.keys():
-            top_k_results = results[:k]
-            top_k_pred = set(r["patch_id"] for r in top_k_results)
-            hits = top_k_pred & target_ids
-            hits_count = len(hits)
-            recall = hits_count / len(target_ids) if target_ids else 0.0
+            top_k_pred = set(r["patch_id"] for r in results[:k])
+            recall = len(top_k_pred & reachable) / len(reachable)
             recalls_at_k[k].append(recall)
             query_recalls[k] = recall
-            
-            # Track from_rag_only hits
-            if hits_count > 0:
-                total_correct_hits[k] += hits_count
-                for r in top_k_results:
-                    if r["patch_id"] in hits and r.get("from_rag_only"):
-                        rag_only_correct_hits[k] += 1
         
-        # Print per-query recall@k
+        # Per-query detail: stdout only when asked, always to CSV when requested
         if verbose:
             recall_str = " | ".join([f"@{k}:{query_recalls[k]:.2f}" for k in [1, 2, 4, 6, 8, 10]])
             print(f"   [{source_id}] targets={len(target_ids)} | {recall_str}")
-        
+
+        detail_rows.append({
+            "source_patch_id": source_id,
+            "n_targets_total": len(target_ids),
+            "n_targets_reachable": len(reachable),
+            "reciprocal_rank": rr,
+            "n_returned": len(results),
+            **{f"recall_at_{k}": query_recalls[k] for k in query_recalls},
+        })
+
         evaluated += 1
-        if verbose and evaluated % 50 == 0:
-                print(f"   Evaluated {evaluated}/{len(gt_by_source)} queries...")
+        if evaluated % progress_every == 0 or evaluated == total_queries:
+            elapsed = time.perf_counter() - started_at
+            rate = evaluated / elapsed if elapsed > 0 else 0.0
+            eta_min = (total_queries - evaluated - skipped_out_of_window) / rate / 60 if rate > 0 else float("nan")
+            running_mrr = float(np.mean(reciprocal_ranks)) if reciprocal_ranks else 0.0
+            print(f"   [{evaluated:>5}/{total_queries}]  MRR={running_mrr:.4f}  "
+                  f"{rate:5.2f} q/s  eta={eta_min:6.1f} min  "
+                  f"out-of-window={skipped_out_of_window}", flush=True)
     
     # Aggregate results
     mrr = np.mean(reciprocal_ranks) if reciprocal_ranks else 0.0
@@ -806,31 +762,44 @@ def evaluate_pipeline(
     print("\n" + "=" * 70)
     print("RESULTS")
     print("=" * 70)
-    print(f"\n📊 Evaluated: {evaluated} queries, skipped: {skipped}")
+
+    print("\n📊 Coverage")
+    print(f"   ground-truth pairs          : {len(gt_pairs)}")
+    print(f"   unique source queries       : {total_queries}")
+    print(f"   source not in dataset       : {skipped}")
+    print(f"   no target within ±{window_days}d      : {skipped_out_of_window}")
+    print(f"   → evaluated (reachable)     : {evaluated}")
+
+    if evaluated < total_queries:
+        print(f"\n   Recall is measured over the {evaluated} queries whose linked patch is")
+        print(f"   actually retrievable within ±{window_days}d. The {skipped_out_of_window} excluded")
+        print(f"   queries cannot be answered at this window regardless of model quality.")
+
     print(f"\n🎯 Mean Reciprocal Rank (MRR): {mrr:.4f}")
-    print(f"\n📈 Recall@k:")
+    print(f"\n📈 Recall@k  (over {evaluated} evaluated queries)")
     for k in [1, 2, 4, 6, 8, 10]:
         print(f"   @{k}: {mean_recalls[k]:.4f}")
-    
-    # Print from_rag_only diagnostic
-    print(f"\n🔍 Union Retrieval Diagnostic (from_rag_only hits in correct predictions):")
-    for k in [1, 2, 4, 6, 8, 10]:
-        total = total_correct_hits[k]
-        rag_only = rag_only_correct_hits[k]
-        pct = (rag_only / total * 100) if total > 0 else 0.0
-        print(f"   @{k}: {rag_only}/{total} correct hits from RAG-only ({pct:.1f}%)")
-    
-    if sum(rag_only_correct_hits.values()) == 0:
-        print("\n   ⚠️  WARNING: No correct hits from RAG-only candidates!")
-        print("   → Union retrieval is NOT helping. Consider signal diversification.")
-    
+
+    elapsed = time.perf_counter() - started_at
+    print(f"\n⏱️  {elapsed/60:.1f} min total ({evaluated/max(elapsed,1e-9):.2f} q/s)")
+
+    if details_out and detail_rows:
+        out_dir = os.path.dirname(details_out)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        pd.DataFrame(detail_rows).to_csv(details_out, index=False)
+        print(f"📝 Per-query details -> {details_out} ({len(detail_rows)} rows)")
+
     return {
         "mrr": mrr,
         "recall": mean_recalls,
         "evaluated": evaluated,
         "skipped": skipped,
-        "rag_only_correct_hits": rag_only_correct_hits,
-        "total_correct_hits": total_correct_hits,
+        "skipped_out_of_window": skipped_out_of_window,
+        "total_queries": total_queries,
+        "window_days": window_days,
+        "elapsed_sec": elapsed,
+        "details_out": details_out if detail_rows else None,
     }
 
 
@@ -874,14 +843,12 @@ def compare_approaches(
     for i, r in enumerate(rag_results[:5], 1):
         print(f"   {i}. [{r['patch_id']}] Score: {r['score']:.4f} - {r['title'][:50]}...")
     
-    # 3. ML → RAG approach (with union retrieval)
-    print(f"\n3️⃣ ML → RAG Approach (with union retrieval):")
+    # 3. ML → RAG approach
+    print(f"\n3️⃣ ML → RAG Approach:")
     combined_results = pipeline.predict(
         patch_ref,
         top_k=top_k,
         window_days=window_days,
-        rag_weight=0.3,
-        use_union_retrieval=True,
     )
     
     # Compare overlap
@@ -910,10 +877,20 @@ def main():
     parser.add_argument("--compare", action="store_true", help="Compare ML vs RAG vs ML→RAG")
     parser.add_argument("--window-days", type=int, default=14, help="Time window in days")
     parser.add_argument("--top-k", type=int, default=10, help="Number of results")
-    parser.add_argument("--rag-weight", type=float, default=0.3, help="RAG weight in combined score")
-    parser.add_argument("--ml-candidates-k", type=int, default=20, help="ML candidates to refine")
     parser.add_argument("--sample-ratio", type=float, default=1.0, help="Fraction of dataset to evaluate (0.0-1.0, default 1.0 = all)")
     parser.add_argument("--random-seed", type=int, default=42, help="Random seed for reproducible sampling")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print the full per-query trace (debugging small samples only; a full sweep is ~60k lines)")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Silence per-query tracing (default for --evaluate; progress + summary still shown)")
+    parser.add_argument("--details-out", default=None,
+                        help="CSV path for per-query rows (source, RR, recall@k) from --evaluate")
+    parser.add_argument("--progress-every", type=int, default=100,
+                        help="Queries between progress lines during --evaluate")
+    parser.add_argument("--ml-weight", type=float, default=0.5,
+                        help="Weight of the ML score in the blended rerank (default 0.5)")
+    parser.add_argument("--rag-weight", type=float, default=0.5,
+                        help="Weight of the RAG score in the blended rerank; 0 = pure ML baseline")
     
     args = parser.parse_args()
     
@@ -931,11 +908,20 @@ def main():
         sys.exit(1)
     
     # Initialize pipeline
+    # Batch mode is quiet by default; single-patch debugging stays verbose.
+    verbose = not args.quiet and (args.verbose or not args.evaluate)
     pipeline = MLToRAGPipeline(
         model_path=model_path,
         project=args.project,
         csv_path=csv_path,
+        verbose=verbose,
     )
+    pipeline.ml_weight = args.ml_weight
+    pipeline.rag_weight = args.rag_weight
+    if args.ml_weight + args.rag_weight <= 0:
+        sys.exit("❌ --ml-weight and --rag-weight cannot both be 0")
+    if args.evaluate:
+        print(f"   per-query tracing: {'ON' if args.verbose else 'OFF'}")
     
     # Run requested test
     if args.patch_id:
@@ -962,8 +948,6 @@ def main():
                 patch_ref,
                 top_k=args.top_k,
                 window_days=args.window_days,
-                rag_weight=args.rag_weight,
-                ml_candidates_k=args.ml_candidates_k,
             )
     
     elif args.evaluate:
@@ -978,10 +962,11 @@ def main():
             gt_path,
             window_days=args.window_days,
             top_k=args.top_k,
-            rag_weight=args.rag_weight,
-            ml_candidates_k=args.ml_candidates_k,
+            verbose=args.verbose,
             sample_ratio=args.sample_ratio,
             random_seed=args.random_seed,
+            details_out=args.details_out,
+            progress_every=args.progress_every,
         )
     
     else:
@@ -994,12 +979,16 @@ def main():
         print(f"  python {sys.argv[0]} --project onap --patch-id <patch_id>")
         print("\n  # Compare approaches:")
         print(f"  python {sys.argv[0]} --project onap --patch-id <patch_id> --compare")
-        print("\n  # Evaluate on ground truth:")
+        print("\n  # Evaluate on ground truth (quiet; progress + summary only):")
         print(f"  python {sys.argv[0]} --project onap --evaluate")
+        print("\n  # Evaluate, keeping per-query numbers as CSV:")
+        print(f"  python {sys.argv[0]} --project onap --evaluate --details-out /kaggle/working/eval_details.csv")
+        print("\n  # Evaluate small sample WITH the full per-query trace:")
+        print(f"  python {sys.argv[0]} --project onap --evaluate --sample-ratio 0.01 --verbose")
         print("\n  # Evaluate on 30%% of dataset (random sample):")
         print(f"  python {sys.argv[0]} --project onap --evaluate --sample-ratio 0.3")
         print("\n  # Custom parameters:")
-        print(f"  python {sys.argv[0]} --project onap --patch-id <id> --rag-weight 0.5 --top-k 20")
+        print(f"  python {sys.argv[0]} --project onap --patch-id <id> --top-k 20")
         
         # Show first patch as example
         print("\n" + "-" * 70)

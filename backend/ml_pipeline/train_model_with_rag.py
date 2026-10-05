@@ -67,7 +67,6 @@ sys.path.insert(0, os.path.join(project_root, 'backend'))
 import argparse
 import ast
 import json
-import re
 from datetime import timedelta
 from pathlib import Path
 
@@ -79,10 +78,16 @@ from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
 from backend.core.improved_rag_engine import ImprovedRAGEngine
+from backend.core.utils import (
+    build_pair_features,
+    cache_is_valid,
+    embeddings_fingerprint,
+    extract_discussion_text,
+    extract_ticket_refs,
+    safe_parse_json,
+    title_desc_texts,
+)
 from condidate_retrieval import CandidateIndex
-
-TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
-
 
 # --------------------------------------------------------------------------
 # Parsing helpers
@@ -100,178 +105,14 @@ def safe_parse_list(x):
         return []
 
 
-def safe_parse_json(x):
-    if isinstance(x, list):
-        return x
-    if x is None or (isinstance(x, float) and pd.isna(x)):
-        return []
-    if not isinstance(x, str):
-        return []
-    try:
-        parsed = json.loads(x)
-        return parsed if isinstance(parsed, list) else []
-    except json.JSONDecodeError:
-        return []
-
-
-# def extract_reviewers(row):
-#     """Best-effort reviewer extraction from change_log / comments entries.
-
-#     Adjust the candidate key names below if your change_log/comments
-#     records use a different schema for identifying the acting user.
-#     """
-#     reviewers = set()
-#     for entry in (row.get("change_log_parsed") or []):
-#         if isinstance(entry, dict):
-#             for key in ("reviewer_username", "reviewer", "author_username", "user", "username"):
-#                 val = entry.get(key)
-#                 if val:
-#                     reviewers.add(str(val).lower())
-#     for entry in (row.get("comments_parsed") or []):
-#         if isinstance(entry, dict):
-#             for key in ("author_username", "reviewer_username", "user", "username", "author"):
-#                 val = entry.get(key)
-#                 if val:
-#                     reviewers.add(str(val).lower())
-#     own = str(row.get("author_username") or "").lower()
-#     reviewers.discard(own)
-#     return reviewers
-
-
-def extract_discussion_text(row):
-    """Best-effort text blob from change_log / comments entries, for SBERT
-    + token comparison the same way title/description are compared.
-
-    Adjust the candidate key names below if your change_log/comments
-    records store the message text under a different field.
-    """
-    parts = []
-    for entry in (row.get("change_log_parsed") or []):
-        if isinstance(entry, dict):
-            for key in ("message", "text", "body", "comment", "description"):
-                val = entry.get(key)
-                if val:
-                    parts.append(str(val))
-                    break
-        elif isinstance(entry, str):
-            parts.append(entry)
-    for entry in (row.get("comments_parsed") or []):
-        if isinstance(entry, dict):
-            for key in ("message", "text", "body", "comment"):
-                val = entry.get(key)
-                if val:
-                    parts.append(str(val))
-                    break
-        elif isinstance(entry, str):
-            parts.append(entry)
-    return " ".join(parts)
-
-
-TICKET_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,9}-\d+|#\d{3,7})\b")
-
-
-def extract_ticket_refs(text):
-    """Pulls bug/ticket-style references (e.g. 'BUG-1234', '#4821') out of
-    text so two patches mentioning the same ticket can be flagged as linked
-    even if their title/description wording differs."""
-    return set(m.upper() for m in TICKET_RE.findall(text or ""))
-
-
-def path2list(p):
-    return p.strip("/").split("/") if isinstance(p, str) and p.strip("/") else []
-
-
-def top_level_component(p):
-    parts = path2list(p)
-    return parts[0] if parts else None
-
-
-def tokenize(text):
-    return set(w.lower() for w in TOKEN_RE.findall(text or ""))
-
-
 # --------------------------------------------------------------------------
 # Feature engineering (symmetric: features(A, B) == features(B, A))
 # --------------------------------------------------------------------------
 
-def get_path_similarity_stats(files_A, files_B):
-    stats = {}
-    set_A, set_B = set(files_A), set(files_B)
-    union = set_A | set_B
-    stats["jaccard"] = len(set_A & set_B) / len(union) if union else 0.0
-    stats["nb_shared"] = len(set_A & set_B)
-    stats["abs_delta_files"] = abs(len(files_A) - len(files_B))
-    stats["min_len_files"] = min(len(files_A), len(files_B))
-    stats["max_len_files"] = max(len(files_A), len(files_B))
-
-    comp_A = {top_level_component(f) for f in files_A if top_level_component(f)}
-    comp_B = {top_level_component(f) for f in files_B if top_level_component(f)}
-    stats["same_component"] = float(bool(comp_A & comp_B))
-
-    if not files_A or not files_B:
-        stats.update({"LCP_mean": 0.0, "LCP_max": 0.0, "LCSuff_mean": 0.0, "LCSuff_max": 0.0})
-        return stats
-
-    def lcp(f1, f2):
-        return sum(1 for a, b in zip(path2list(f1), path2list(f2)) if a == b)
-
-    def lcsuff(f1, f2):
-        return sum(1 for a, b in zip(reversed(path2list(f1)), reversed(path2list(f2))) if a == b)
-
-    lcp_scores = [lcp(fa, fb) / max(len(path2list(fa)), len(path2list(fb)), 1) for fa in files_A for fb in files_B]
-    lcsuff_scores = [lcsuff(fa, fb) / max(len(path2list(fa)), len(path2list(fb)), 1) for fa in files_A for fb in files_B]
-    stats["LCP_mean"] = float(np.mean(lcp_scores))
-    stats["LCP_max"] = float(np.max(lcp_scores))
-    stats["LCSuff_mean"] = float(np.mean(lcsuff_scores))
-    stats["LCSuff_max"] = float(np.max(lcsuff_scores))
-    return stats
-
-
-def token_jaccard(text_a, text_b):
-    a, b = tokenize(text_a), tokenize(text_b)
-    union = a | b
-    return len(a & b) / len(union) if union else 0.0
-
-
-def build_features(df, emb, emb_disc, i, j):
-    row_i, row_j = df.iloc[i], df.iloc[j]
-    sim_cosine = float(cosine_similarity(emb[i].reshape(1, -1), emb[j].reshape(1, -1))[0][0])
-    file_stats = get_path_similarity_stats(row_i["files_parsed"], row_j["files_parsed"])
-    text_i = f"{row_i['title']} {row_i['description']}"
-    text_j = f"{row_j['title']} {row_j['description']}"
-
-    # author_i = str(row_i.get("author_username") or "")
-    # author_j = str(row_j.get("author_username") or "")
-
-    # reviewers_i = row_i.get("reviewers", set())
-    # reviewers_j = row_j.get("reviewers", set())
-
-    has_disc_i = bool(row_i.get("has_discussion"))
-    has_disc_j = bool(row_j.get("has_discussion"))
-    if has_disc_i and has_disc_j:
-        sim_cosine_discussion = float(cosine_similarity(emb_disc[i].reshape(1, -1), emb_disc[j].reshape(1, -1))[0][0])
-        token_jaccard_discussion = token_jaccard(row_i["discussion_text"], row_j["discussion_text"])
-    else:
-        sim_cosine_discussion = 0.0
-        token_jaccard_discussion = 0.0
-
-    ticket_refs_i = row_i.get("ticket_refs", set())
-    ticket_refs_j = row_j.get("ticket_refs", set())
-
-    feats = {
-        **file_stats,
-        "sim_cosine": sim_cosine,
-        "token_jaccard": token_jaccard(text_i, text_j),
-        "delta_time_hours": abs((row_i["created_time"] - row_j["created_time"]).total_seconds() / 3600),
-        # "same_author": float(bool(author_i) and author_i == author_j),
-        # "same_reviewer": float(bool(reviewers_i & reviewers_j)),
-        # "nb_shared_reviewers": len(reviewers_i & reviewers_j),
-        "sim_cosine_discussion": sim_cosine_discussion,
-        "token_jaccard_discussion": token_jaccard_discussion,
-        "has_discussion_both": float(has_disc_i and has_disc_j),
-        "shares_ticket_ref": float(bool(ticket_refs_i & ticket_refs_j)),
-    }
-    return feats
+# get_path_similarity_stats / token_jaccard / build_pair_features now live in
+# core.utils and are shared with serving, so a saved model's feature_cols can
+# never drift from what scripts/ml_to_rag_pipeline.py computes.
+build_features = build_pair_features
 
 
 # --------------------------------------------------------------------------
@@ -286,9 +127,7 @@ def load_dataset(csv_path):
     df["author_username"] = df.get("author_username", "").fillna("") if "author_username" in df.columns else ""
     df["files_parsed"] = df["files"].apply(safe_parse_list)
     df["change_log_parsed"] = df["change_log"].apply(safe_parse_json) if "change_log" in df.columns else [[] for _ in range(len(df))] 
-    print("change_log_parsed",df["change_log_parsed"].head())
     df["comments_parsed"] = df["comments"].apply(safe_parse_json) if "comments" in df.columns else [[] for _ in range(len(df))]
-    print("comments_parsed",df["comments_parsed"].count())
     # df["reviewers"] = df.apply(extract_reviewers, axis=1)
     df["discussion_text"] = df.apply(extract_discussion_text, axis=1)
     df["has_discussion"] = df["discussion_text"].str.strip().str.len() > 0
@@ -298,17 +137,19 @@ def load_dataset(csv_path):
 
 
 def load_or_compute_embeddings(df, sbert_model_name, cache_path):
-    texts = (df["title"] + " " + df["description"]).tolist()
+    texts = title_desc_texts(df)
     discussion_texts = df["discussion_text"].tolist()
 
     if cache_path:
         cache_path = Path(cache_path)
         if cache_path.exists():
             cached = np.load(cache_path, allow_pickle=True).item()
-            if cached.get("model_name") == sbert_model_name and cached.get("n_rows") == len(df):
+            if (cache_is_valid(cached, df, sbert_model_name, texts)
+                    and cached.get("discussion_fingerprint")
+                    == embeddings_fingerprint(df["patch_id"], discussion_texts)):
                 print(f"  loaded cached embeddings from {cache_path}")
                 return cached["embeddings"], cached["discussion_embeddings"]
-            print("  cache found but stale (model or row count changed) \u2014 recomputing")
+            print("  cache stale (model/rows/order/text changed) - recomputing")
 
     sbert = SentenceTransformer(sbert_model_name)
     emb = sbert.encode(texts, batch_size=64, show_progress_bar=True, convert_to_numpy=True)
@@ -316,8 +157,14 @@ def load_or_compute_embeddings(df, sbert_model_name, cache_path):
 
     if cache_path:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(cache_path, {"model_name": sbert_model_name, "n_rows": len(df),
-                              "embeddings": emb, "discussion_embeddings": emb_disc})
+        np.save(cache_path, {
+            "model_name": sbert_model_name,
+            "n_rows": len(df),
+            "embeddings": emb,
+            "discussion_embeddings": emb_disc,
+            "fingerprint": embeddings_fingerprint(df["patch_id"], texts),
+            "discussion_fingerprint": embeddings_fingerprint(df["patch_id"], discussion_texts),
+        })
         print(f"  cached embeddings to {cache_path}")
 
     return emb, emb_disc
@@ -526,8 +373,20 @@ def train_model(X_train, y_train, group_train, X_test, y_test, group_test, featu
     return model
 
 
-def evaluate(model, df, emb, emb_disc, anchors, candidate_fn, feature_cols, top_k, positives_by_anchor):
-    reciprocal_ranks, recalls = [], []
+def evaluate(model, df, emb, emb_disc, anchors, candidate_fn, feature_cols, top_ks, positives_by_anchor):
+    """Score + rank every anchor ONCE per window, then report MRR and Recall@k.
+
+    k only changes where the ranked list is truncated, so the expensive part
+    (candidate retrieval + feature build + predict + sort) does not depend on
+    k. Calling this once per k repeated that work len(top_ks) times per window
+    -- 24x across [2, 7, 14, 30] x [1, 2, 4, 6, 8, 10] -- for identical output.
+    """
+    if isinstance(top_ks, int):
+        top_ks = [top_ks]
+
+    per_k_recalls = {k: [] for k in top_ks}
+    reciprocal_ranks = []
+
     for anchor_idx in anchors:
         candidate_idxs = candidate_fn(anchor_idx)
         if not candidate_idxs:
@@ -545,12 +404,13 @@ def evaluate(model, df, emb, emb_disc, anchors, candidate_fn, feature_cols, top_
         rank = next((r for r, cand in enumerate(ranked, start=1) if cand in positive_set), None)
         reciprocal_ranks.append(1.0 / rank if rank else 0.0)
 
-        recalled = sum(1 for c in ranked[:top_k] if c in positive_set)
-        recalls.append(recalled / len(positive_set))
+        for k in top_ks:
+            recalled = sum(1 for c in ranked[:k] if c in positive_set)
+            per_k_recalls[k].append(recalled / len(positive_set))
 
     mrr = float(np.mean(reciprocal_ranks)) if reciprocal_ranks else 0.0
-    recall_k = float(np.mean(recalls)) if recalls else 0.0
-    return mrr, recall_k, len(reciprocal_ranks)
+    recalls = {k: (float(np.mean(v)) if v else 0.0) for k, v in per_k_recalls.items()}
+    return mrr, recalls, len(reciprocal_ranks)
 
 
 # --------------------------------------------------------------------------
@@ -613,8 +473,14 @@ def main():
     if args.rag_candidates:
         print(f"Building RAG engine for candidate retrieval (strategy={args.rag_strategy}, k={args.rag_k})...")
         rag_engine = ImprovedRAGEngine(use_hybrid=True)
-        # Load the same dataset into RAG engine (use "train" as project key)
-        rag_engine.load_project("train", args.dataset)
+        # The engine reads the CSV unsorted while this trainer's df is sorted by
+        # created_time, so the two can never share one cache file -- sharing it
+        # would make each side invalidate the other's fingerprint on every run.
+        rag_cache = None
+        if args.embedding_cache:
+            _p = Path(args.embedding_cache)
+            rag_cache = str(_p.with_name(f"{_p.stem}_rag{_p.suffix or '.npy'}"))
+        rag_engine.load_project("train", args.dataset, embeddings_path=rag_cache)
         print(f"  RAG engine initialized with {len(rag_engine.datasets.get('train', []))} patches")
 
     if args.disable_ann and not args.rag_candidates:
@@ -719,12 +585,12 @@ def main():
         print(header)
         print("  " + "-" * (len(header) - 2))
         eval_candidate_fn = lambda a, win=win: get_hybrid_candidates(a, win)
+        mrr, recalls, n_eval = evaluate(
+            model, df, emb, emb_disc, test_anchors,
+            eval_candidate_fn, feature_cols, eval_top_ks, positives_by_anchor
+        )
         for k in eval_top_ks:
-            mrr, recall_k, n_eval = evaluate(
-                model, df, emb, emb_disc, test_anchors,
-                eval_candidate_fn, feature_cols, k, positives_by_anchor
-            )
-            print(f"  {k:>4}  {mrr:>8.4f}  {recall_k:>10.4f}  {n_eval:>9}")
+            print(f"  {k:>4}  {mrr:>8.4f}  {recalls[k]:>10.4f}  {n_eval:>9}")
 
     importances = sorted(zip(feature_cols, model.feature_importance()), key=lambda x: -x[1])
     print("Top feature importances:")
