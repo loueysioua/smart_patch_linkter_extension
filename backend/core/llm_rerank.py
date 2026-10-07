@@ -15,9 +15,30 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# ``backend/.env`` relative to this file -- core/ -> backend/
+_DOTENV_PATHS = (
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, ".env"),
+    os.path.join(os.getcwd(), ".env"),
+)
+
+
+def _load_dotenv() -> None:
+    """Best-effort .env load. Absent python-dotenv is not an error."""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    # CWD search covers the normal case (run from backend/); the explicit paths
+    # cover being invoked from elsewhere. Existing env vars are never overwritten.
+    load_dotenv()
+    for path in _DOTENV_PATHS:
+        if os.path.exists(path):
+            load_dotenv(path)
 
 # Descriptions in this dataset run long (mean description is ~440 chars, but
 # change_log blobs are far bigger). Untruncated, 10 candidates can blow past a
@@ -63,15 +84,22 @@ def build_rerank_prompt(
     target: dict[str, Any],
     candidates: list[dict[str, Any]],
     max_description_chars: int = MAX_DESCRIPTION_CHARS,
+    max_title_chars: int = MAX_TITLE_CHARS,
+    max_files: int = MAX_FILES_LISTED,
 ) -> str:
     """Build the reranking prompt. Exposed separately so it can be inspected
-    (and length-tested) without spending an API call."""
+    (and length-tested) without spending an API call.
+
+    The three limits are context-window bounds applied at *send* time. Stored
+    text is never trimmed -- ``scripts/hydrate_candidates.py`` keeps raw values
+    so raising a limit never requires re-hydrating.
+    """
     candidate_block = "\n".join(
         f"""
 --- Candidate {i + 1} ---
 - **ID:** {c.get('patch_id')}
-- **Title:** {_clip(c.get('title'), MAX_TITLE_CHARS)}
-- **Files:** {_files_summary(c.get('files'))}
+- **Title:** {_clip(c.get('title'), max_title_chars)}
+- **Files:** {_files_summary(c.get('files'), max_files)}
 - **Description:**
 {_clip(c.get('description'), max_description_chars)}
 """
@@ -89,8 +117,8 @@ subsystem. Prefer substantive links over superficial keyword overlap.
 
 ### Target Patch
 - **ID:** {target.get('patch_id')}
-- **Title:** {_clip(target.get('title'), MAX_TITLE_CHARS)}
-- **Files:** {_files_summary(target.get('files'))}
+- **Title:** {_clip(target.get('title'), max_title_chars)}
+- **Files:** {_files_summary(target.get('files'), max_files)}
 - **Description:**
 {_clip(target.get('description'), max_description_chars)}
 
@@ -158,7 +186,7 @@ def parse_rerank_response(
     known = {str(c["patch_id"]) for c in candidates}
     unknown = [x for x in parsed if x not in known]
     if unknown:
-        logger.warning("LLM returned %d unknown id(s), ignored: %s", len(unknown), unknown[:5])
+        logger.debug("LLM returned %d unknown id(s), ignored: %s", len(unknown), unknown[:5])
 
     return apply_rerank_order(parsed, candidates), None
 
@@ -169,6 +197,8 @@ def rerank_candidates(
     candidates: list[dict[str, Any]],
     model_name: str = "gpt-4o-mini",
     max_description_chars: int = MAX_DESCRIPTION_CHARS,
+    max_title_chars: int = MAX_TITLE_CHARS,
+    max_files: int = MAX_FILES_LISTED,
     timeout: float | None = 60.0,
 ) -> list[dict[str, Any]]:
     """Ask a chat model to rerank *candidates* by relevance to *target*.
@@ -183,6 +213,8 @@ def rerank_candidates(
         candidates: Candidate patch dicts (must carry ``patch_id``).
         model_name: Provider model identifier.
         max_description_chars: Per-field clip length for the prompt.
+        max_title_chars: Title clip length.
+        max_files: Maximum file paths listed per patch.
         timeout: Per-request timeout in seconds.
 
     Returns:
@@ -191,8 +223,13 @@ def rerank_candidates(
     if not candidates:
         return []
 
-    prompt = build_rerank_prompt(target, candidates, max_description_chars)
-    logger.info("Sending %d candidates to %s for reranking…", len(candidates), model_name)
+    prompt = build_rerank_prompt(
+        target, candidates,
+        max_description_chars=max_description_chars,
+        max_title_chars=max_title_chars,
+        max_files=max_files,
+    )
+    logger.debug("Sending %d candidates to %s for reranking…", len(candidates), model_name)
 
     kwargs: dict[str, Any] = {
         "model": model_name,
@@ -215,5 +252,54 @@ def rerank_candidates(
         logger.debug("Raw LLM response: %s", response_text)
         return candidates
 
-    logger.info("Reranked %d candidates via %s.", len(reranked), model_name)
+    logger.debug("Reranked %d candidates via %s.", len(reranked), model_name)
     return reranked
+
+
+def build_openai_client(base_url: str | None = None, timeout: float | None = 60.0):
+    """Construct an OpenAI-compatible client.
+
+    ``openai`` is imported lazily inside this function, so importing this module
+    stays dependency-free (see the module docstring) and
+    ``scripts/llm_rerank_stage.py`` can use it without pulling in
+    sentence-transformers / faiss / joblib.
+
+    Args:
+        base_url: Any OpenAI-compatible endpoint -- Ollama, llama.cpp, vLLM,
+            LM Studio. When set, no API key is required.
+        timeout: Default per-request timeout in seconds.
+
+    Returns:
+        An ``openai.OpenAI`` instance.
+
+    Raises:
+        RuntimeError: if the SDK is missing, or no key/base_url is available.
+    """
+    import os
+
+    # Load .env before reading the environment. The old scripts/llm_rerank.py did
+    # this; the split stages did not, so a key present in backend/.env was
+    # invisible and the stage failed with "needs OPENAI_API_KEY". Real env vars
+    # still win -- load_dotenv does not overwrite them.
+    _load_dotenv()
+
+    try:
+        from openai import OpenAI
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise RuntimeError(
+            "LLM rerank needs the 'openai' package: pip install openai"
+        ) from exc
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key and not base_url:
+        raise RuntimeError(
+            "LLM rerank needs OPENAI_API_KEY (checked the environment and "
+            f"{_DOTENV_PATHS}), or --llm-base-url for a local endpoint."
+        )
+
+    kwargs: dict[str, Any] = {"api_key": api_key or "not-needed"}
+    if base_url:
+        kwargs["base_url"] = base_url
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+    return OpenAI(**kwargs)

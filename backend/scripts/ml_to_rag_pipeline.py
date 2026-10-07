@@ -34,7 +34,7 @@ backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, backend_dir)
 
 from core.improved_rag_engine import ImprovedRAGEngine
-from core.llm_rerank import rerank_candidates
+from core.llm_rerank import build_openai_client, rerank_candidates
 from core.utils import (
     assert_embeddings_aligned,
     build_pair_features,
@@ -555,31 +555,11 @@ class MLToRAGPipeline:
             json.dump(self.llm_cache, fh)
 
     def _get_llm_client(self):
-        """Build the OpenAI-compatible client lazily.
-
-        Works against any OpenAI-compatible endpoint via ``--llm-base-url``
-        (Ollama, llama.cpp, vLLM, LM Studio), so the stage is usable without
-        internet access.
-        """
-        if self._llm_client is not None:
-            return self._llm_client
-        try:
-            from openai import OpenAI
-        except ImportError:
-            raise RuntimeError(
-                "--llm-rerank needs the 'openai' package: pip install openai"
+        """Build the OpenAI-compatible client lazily (see core.llm_rerank)."""
+        if self._llm_client is None:
+            self._llm_client = build_openai_client(
+                base_url=self.llm_base_url, timeout=self.llm_timeout,
             )
-
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key and not self.llm_base_url:
-            raise RuntimeError(
-                "--llm-rerank needs OPENAI_API_KEY, or --llm-base-url for a local endpoint"
-            )
-
-        kwargs: Dict[str, Any] = {"api_key": api_key or "not-needed"}
-        if self.llm_base_url:
-            kwargs["base_url"] = self.llm_base_url
-        self._llm_client = OpenAI(**kwargs)
         return self._llm_client
 
     def predict_llm_rerank(
@@ -750,6 +730,7 @@ def evaluate_pipeline(
     details_out: str = None,
     progress_every: int = 100,
     llm_limit: int = 0,
+    candidates_out: str = None,
 ):
     """Evaluate the ML → RAG pipeline on ground truth.
 
@@ -784,6 +765,10 @@ def evaluate_pipeline(
         random_seed: Random seed for reproducible sampling
         details_out: Optional CSV path for per-query rows
         progress_every: Queries between progress lines
+        candidates_out: Optional JSONL hand-off for ``scripts/llm_rerank_stage.py``.
+            Records the ranked candidate ids plus the reachable targets per query,
+            so the LLM stage runs as a separate process with its own (tiny) memory
+            footprint instead of competing with this pipeline for RAM.
     
     Returns:
         Dictionary with evaluation metrics
@@ -828,6 +813,12 @@ def evaluate_pipeline(
     reciprocal_ranks = []
     recalls_at_k = {k: [] for k in [1, 2, 4, 6, 8, 10]}
     detail_rows = []
+    cand_fh = None
+    if candidates_out:
+        out_dir = os.path.dirname(candidates_out)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        cand_fh = open(candidates_out, "w", encoding="utf-8")
 
     total_queries = len(gt_by_source)
     started_at = time.perf_counter()
@@ -919,6 +910,19 @@ def evaluate_pipeline(
             recall_str = " | ".join([f"@{k}:{query_recalls[k]:.2f}" for k in [1, 2, 4, 6, 8, 10]])
             print(f"   [{source_id}] targets={len(target_ids)} | {recall_str}")
 
+        if cand_fh is not None:
+            # incremental + flushed: a crash keeps everything up to this point
+            cand_fh.write(json.dumps({
+                "source_patch_id": source_id,
+                "candidates": [r["patch_id"] for r in results],
+                "reachable_targets": sorted(reachable),
+                "n_targets_total": len(target_ids),
+                "window_days": window_days,
+                "top_k": top_k,
+                "llm_applied": bool(llm_applied),
+            }) + "\n")
+            cand_fh.flush()
+
         detail_rows.append({
             "source_patch_id": source_id,
             "n_targets_total": len(target_ids),
@@ -977,6 +981,12 @@ def evaluate_pipeline(
 
     pipeline._llm_save_cache()
 
+    if cand_fh is not None:
+        cand_fh.close()
+        print(f"\n📦 Candidate hand-off -> {candidates_out} ({evaluated} rows)")
+        print("   next: python scripts/llm_rerank_stage.py --candidates "
+              f"{candidates_out} --out <metrics.csv>")
+
     if details_out and detail_rows:
         out_dir = os.path.dirname(details_out)
         if out_dir:
@@ -994,6 +1004,7 @@ def evaluate_pipeline(
         "window_days": window_days,
         "elapsed_sec": elapsed,
         "details_out": details_out if detail_rows else None,
+        "candidates_out": candidates_out,
     }
 
 
@@ -1079,6 +1090,10 @@ def main():
                         help="Silence per-query tracing (default for --evaluate; progress + summary still shown)")
     parser.add_argument("--details-out", default=None,
                         help="CSV path for per-query rows (source, RR, recall@k) from --evaluate")
+    parser.add_argument("--candidates-out", default=None,
+                        help="JSONL hand-off for scripts/llm_rerank_stage.py: ranked candidate "
+                             "ids + reachable targets per query, so the LLM stage can run as an "
+                             "independent process (keeps peak RAM at max(A) instead of A+B)")
     parser.add_argument("--progress-every", type=int, default=100,
                         help="Queries between progress lines during --evaluate")
     parser.add_argument("--ml-weight", type=float, default=0.5,
@@ -1197,6 +1212,7 @@ def main():
             details_out=args.details_out,
             progress_every=args.progress_every,
             llm_limit=args.llm_limit,
+            candidates_out=args.candidates_out,
         )
     
     else:
