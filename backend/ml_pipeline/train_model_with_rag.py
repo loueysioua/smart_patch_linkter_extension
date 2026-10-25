@@ -22,7 +22,6 @@ the dataset and in the ground-truth pairs file).
 `files` must be a stringified Python list (e.g. "['a/b.py', 'c/d.py']").
 `change_log` / `comments`, if present, are used for two things:
   1. deriving a reviewer/commenter list per patch (see `extract_reviewers`)
-  2. building a "discussion text" blob per patch (see `extract_discussion_text`)
      which is SBERT-embedded and token-compared the same way title/description
      are, plus scanned for shared ticket/bug references.
 If your schema stores these differently, adjust those two functions — the
@@ -40,8 +39,15 @@ Design notes / assumptions (see conversation for rationale):
     anchor (the earlier-created patch of the two). This avoids duplicate,
     identical feature rows and avoids the same pair leaking across the
     train/test split.
-  - Candidates for an anchor are pulled from the full dataset within a
-    +/- `window_days` window, mirroring the engine's `get_candidates`.
+  - Candidates for an anchor are pulled from a hybrid pool: everything in
+    the full dataset within a +/- `window_days` window, UNION the top
+    `--ann-k` nearest neighbors by embedding cosine similarity (via FAISS,
+    see candidate_retrieval.py), bounded to +/- `--ann-max-days`, UNION
+    (optionally) RAG-based candidates from multi-query or file-boost
+    retrieval (see --rag-candidates). This recovers ground-truth pairs
+    that are textually/semantically linked but fall outside the plain time
+    window -- pass --disable-ann to fall back to the pure time-window pool
+    for comparison.
   - Train/test split is time-based (chronological), not random: anchors
     with created_time before the split point go to train, the rest to
     test. This matches "70% train / 30% test" via a time quantile.
@@ -50,10 +56,16 @@ Design notes / assumptions (see conversation for rationale):
     match the harder distribution the model sees at inference time.
 """
 
+import sys
+import os
+# Add project root to sys.path so 'backend' can be resolved when running this script directly
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+sys.path.insert(0, project_root)
+sys.path.insert(0, os.path.join(project_root, 'backend'))
+
 import argparse
 import ast
 import json
-import re
 from datetime import timedelta
 from pathlib import Path
 
@@ -64,8 +76,16 @@ import pandas as pd
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
-TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
-
+from backend.core.improved_rag_engine import ImprovedRAGEngine
+from backend.core.utils import (
+    build_pair_features,
+    cache_is_valid,
+    embeddings_fingerprint,
+    extract_ticket_refs,
+    safe_parse_json,
+    title_desc_texts,
+)
+from condidate_retrieval import CandidateIndex
 
 # --------------------------------------------------------------------------
 # Parsing helpers
@@ -83,178 +103,14 @@ def safe_parse_list(x):
         return []
 
 
-def safe_parse_json(x):
-    if isinstance(x, list):
-        return x
-    if x is None or (isinstance(x, float) and pd.isna(x)):
-        return []
-    if not isinstance(x, str):
-        return []
-    try:
-        parsed = json.loads(x)
-        return parsed if isinstance(parsed, list) else []
-    except json.JSONDecodeError:
-        return []
-
-
-# def extract_reviewers(row):
-#     """Best-effort reviewer extraction from change_log / comments entries.
-
-#     Adjust the candidate key names below if your change_log/comments
-#     records use a different schema for identifying the acting user.
-#     """
-#     reviewers = set()
-#     for entry in (row.get("change_log_parsed") or []):
-#         if isinstance(entry, dict):
-#             for key in ("reviewer_username", "reviewer", "author_username", "user", "username"):
-#                 val = entry.get(key)
-#                 if val:
-#                     reviewers.add(str(val).lower())
-#     for entry in (row.get("comments_parsed") or []):
-#         if isinstance(entry, dict):
-#             for key in ("author_username", "reviewer_username", "user", "username", "author"):
-#                 val = entry.get(key)
-#                 if val:
-#                     reviewers.add(str(val).lower())
-#     own = str(row.get("author_username") or "").lower()
-#     reviewers.discard(own)
-#     return reviewers
-
-
-def extract_discussion_text(row):
-    """Best-effort text blob from change_log / comments entries, for SBERT
-    + token comparison the same way title/description are compared.
-
-    Adjust the candidate key names below if your change_log/comments
-    records store the message text under a different field.
-    """
-    parts = []
-    for entry in (row.get("change_log_parsed") or []):
-        if isinstance(entry, dict):
-            for key in ("message", "text", "body", "comment", "description"):
-                val = entry.get(key)
-                if val:
-                    parts.append(str(val))
-                    break
-        elif isinstance(entry, str):
-            parts.append(entry)
-    for entry in (row.get("comments_parsed") or []):
-        if isinstance(entry, dict):
-            for key in ("message", "text", "body", "comment"):
-                val = entry.get(key)
-                if val:
-                    parts.append(str(val))
-                    break
-        elif isinstance(entry, str):
-            parts.append(entry)
-    return " ".join(parts)
-
-
-TICKET_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,9}-\d+|#\d{3,7})\b")
-
-
-def extract_ticket_refs(text):
-    """Pulls bug/ticket-style references (e.g. 'BUG-1234', '#4821') out of
-    text so two patches mentioning the same ticket can be flagged as linked
-    even if their title/description wording differs."""
-    return set(m.upper() for m in TICKET_RE.findall(text or ""))
-
-
-def path2list(p):
-    return p.strip("/").split("/") if isinstance(p, str) and p.strip("/") else []
-
-
-def top_level_component(p):
-    parts = path2list(p)
-    return parts[0] if parts else None
-
-
-def tokenize(text):
-    return set(w.lower() for w in TOKEN_RE.findall(text or ""))
-
-
 # --------------------------------------------------------------------------
 # Feature engineering (symmetric: features(A, B) == features(B, A))
 # --------------------------------------------------------------------------
 
-def get_path_similarity_stats(files_A, files_B):
-    stats = {}
-    set_A, set_B = set(files_A), set(files_B)
-    union = set_A | set_B
-    stats["jaccard"] = len(set_A & set_B) / len(union) if union else 0.0
-    stats["nb_shared"] = len(set_A & set_B)
-    stats["abs_delta_files"] = abs(len(files_A) - len(files_B))
-    stats["min_len_files"] = min(len(files_A), len(files_B))
-    stats["max_len_files"] = max(len(files_A), len(files_B))
-
-    comp_A = {top_level_component(f) for f in files_A if top_level_component(f)}
-    comp_B = {top_level_component(f) for f in files_B if top_level_component(f)}
-    stats["same_component"] = float(bool(comp_A & comp_B))
-
-    if not files_A or not files_B:
-        stats.update({"LCP_mean": 0.0, "LCP_max": 0.0, "LCSuff_mean": 0.0, "LCSuff_max": 0.0})
-        return stats
-
-    def lcp(f1, f2):
-        return sum(1 for a, b in zip(path2list(f1), path2list(f2)) if a == b)
-
-    def lcsuff(f1, f2):
-        return sum(1 for a, b in zip(reversed(path2list(f1)), reversed(path2list(f2))) if a == b)
-
-    lcp_scores = [lcp(fa, fb) / max(len(path2list(fa)), len(path2list(fb)), 1) for fa in files_A for fb in files_B]
-    lcsuff_scores = [lcsuff(fa, fb) / max(len(path2list(fa)), len(path2list(fb)), 1) for fa in files_A for fb in files_B]
-    stats["LCP_mean"] = float(np.mean(lcp_scores))
-    stats["LCP_max"] = float(np.max(lcp_scores))
-    stats["LCSuff_mean"] = float(np.mean(lcsuff_scores))
-    stats["LCSuff_max"] = float(np.max(lcsuff_scores))
-    return stats
-
-
-def token_jaccard(text_a, text_b):
-    a, b = tokenize(text_a), tokenize(text_b)
-    union = a | b
-    return len(a & b) / len(union) if union else 0.0
-
-
-def build_features(df, emb, emb_disc, i, j):
-    row_i, row_j = df.iloc[i], df.iloc[j]
-    sim_cosine = float(cosine_similarity(emb[i].reshape(1, -1), emb[j].reshape(1, -1))[0][0])
-    file_stats = get_path_similarity_stats(row_i["files_parsed"], row_j["files_parsed"])
-    text_i = f"{row_i['title']} {row_i['description']}"
-    text_j = f"{row_j['title']} {row_j['description']}"
-
-    # author_i = str(row_i.get("author_username") or "")
-    # author_j = str(row_j.get("author_username") or "")
-
-    # reviewers_i = row_i.get("reviewers", set())
-    # reviewers_j = row_j.get("reviewers", set())
-
-    has_disc_i = bool(row_i.get("has_discussion"))
-    has_disc_j = bool(row_j.get("has_discussion"))
-    if has_disc_i and has_disc_j:
-        sim_cosine_discussion = float(cosine_similarity(emb_disc[i].reshape(1, -1), emb_disc[j].reshape(1, -1))[0][0])
-        token_jaccard_discussion = token_jaccard(row_i["discussion_text"], row_j["discussion_text"])
-    else:
-        sim_cosine_discussion = 0.0
-        token_jaccard_discussion = 0.0
-
-    ticket_refs_i = row_i.get("ticket_refs", set())
-    ticket_refs_j = row_j.get("ticket_refs", set())
-
-    feats = {
-        **file_stats,
-        "sim_cosine": sim_cosine,
-        "token_jaccard": token_jaccard(text_i, text_j),
-        "delta_time_hours": abs((row_i["created_time"] - row_j["created_time"]).total_seconds() / 3600),
-        # "same_author": float(bool(author_i) and author_i == author_j),
-        # "same_reviewer": float(bool(reviewers_i & reviewers_j)),
-        # "nb_shared_reviewers": len(reviewers_i & reviewers_j),
-        "sim_cosine_discussion": sim_cosine_discussion,
-        "token_jaccard_discussion": token_jaccard_discussion,
-        "has_discussion_both": float(has_disc_i and has_disc_j),
-        "shares_ticket_ref": float(bool(ticket_refs_i & ticket_refs_j)),
-    }
-    return feats
+# get_path_similarity_stats / token_jaccard / build_pair_features now live in
+# core.utils and are shared with serving, so a saved model's feature_cols can
+# never drift from what scripts/ml_to_rag_pipeline.py computes.
+build_features = build_pair_features
 
 
 # --------------------------------------------------------------------------
@@ -268,42 +124,39 @@ def load_dataset(csv_path):
     df["description"] = df["description"].fillna("")
     df["author_username"] = df.get("author_username", "").fillna("") if "author_username" in df.columns else ""
     df["files_parsed"] = df["files"].apply(safe_parse_list)
-    df["change_log_parsed"] = df["change_log"].apply(safe_parse_json) if "change_log" in df.columns else [[] for _ in range(len(df))] 
-    print("change_log_parsed",df["change_log_parsed"].head())
-    df["comments_parsed"] = df["comments"].apply(safe_parse_json) if "comments" in df.columns else [[] for _ in range(len(df))]
-    print("comments_parsed",df["comments_parsed"].head())
-    # df["reviewers"] = df.apply(extract_reviewers, axis=1)
-    df["discussion_text"] = df.apply(extract_discussion_text, axis=1)
-    df["has_discussion"] = df["discussion_text"].str.strip().str.len() > 0
-    df["ticket_refs"] = (df["title"] + " " + df["description"] + " " + df["discussion_text"]).apply(extract_ticket_refs)
+    # title+description only: a ticket named solely in a review comment did not
+    # exist at submission time, so counting it would leak the future.
+    df["ticket_refs"] = (df["title"] + " " + df["description"]).apply(extract_ticket_refs)
     df = df.sort_values("created_time").reset_index(drop=True)
     return df
 
 
 def load_or_compute_embeddings(df, sbert_model_name, cache_path):
-    texts = (df["title"] + " " + df["description"]).tolist()
-    discussion_texts = df["discussion_text"].tolist()
+    texts = title_desc_texts(df)
 
     if cache_path:
         cache_path = Path(cache_path)
         if cache_path.exists():
             cached = np.load(cache_path, allow_pickle=True).item()
-            if cached.get("model_name") == sbert_model_name and cached.get("n_rows") == len(df):
+            if cache_is_valid(cached, df, sbert_model_name, texts):
                 print(f"  loaded cached embeddings from {cache_path}")
-                return cached["embeddings"], cached["discussion_embeddings"]
-            print("  cache found but stale (model or row count changed) \u2014 recomputing")
+                return cached["embeddings"]
+            print("  cache stale (model/rows/order/text changed) - recomputing")
 
     sbert = SentenceTransformer(sbert_model_name)
     emb = sbert.encode(texts, batch_size=64, show_progress_bar=True, convert_to_numpy=True)
-    emb_disc = sbert.encode(discussion_texts, batch_size=64, show_progress_bar=True, convert_to_numpy=True)
 
     if cache_path:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(cache_path, {"model_name": sbert_model_name, "n_rows": len(df),
-                              "embeddings": emb, "discussion_embeddings": emb_disc})
+        np.save(cache_path, {
+            "model_name": sbert_model_name,
+            "n_rows": len(df),
+            "embeddings": emb,
+            "fingerprint": embeddings_fingerprint(df["patch_id"], texts),
+        })
         print(f"  cached embeddings to {cache_path}")
 
-    return emb, emb_disc
+    return emb
 
 
 def load_ground_truth(path, df):
@@ -345,27 +198,70 @@ def load_ground_truth(path, df):
 # Candidate windowing / negative sampling / group construction
 # --------------------------------------------------------------------------
 
-def report_window_coverage(df, pairs, window_days):
+def report_window_coverage(df, pairs, window_days, candidate_fn=None, ann_enabled=False, rag_enabled=False):
     """Diagnostic: how many ground-truth pairs are actually usable at this
-    window size, before we spend time building groups / training."""
+    window size, before we spend time building groups / training.
+    
+    If candidate_fn is provided, also reports how many pairs are recovered
+    by the hybrid candidate pool (ANN + RAG) vs pure time-window.
+    """
     deltas_hours = []
-    unusable = 0
+    unusable_by_window = 0
     for i, j in pairs:
         delta_h = abs((df.loc[i, "created_time"] - df.loc[j, "created_time"]).total_seconds() / 3600)
         deltas_hours.append(delta_h)
         if delta_h > window_days * 24:
-            unusable += 1
+            unusable_by_window += 1
 
     deltas_days = np.array(deltas_hours) / 24
     print(f"  pair time-deltas (days): median={np.median(deltas_days):.1f}  "
           f"p75={np.percentile(deltas_days, 75):.1f}  p90={np.percentile(deltas_days, 90):.1f}  "
           f"max={np.max(deltas_days):.1f}")
-    usable_pct = 100 * (len(pairs) - unusable) / len(pairs) if pairs else 0
-    print(f"  {len(pairs) - unusable}/{len(pairs)} pairs ({usable_pct:.1f}%) fall within "
+    usable_pct = 100 * (len(pairs) - unusable_by_window) / len(pairs) if pairs else 0
+    print(f"  {len(pairs) - unusable_by_window}/{len(pairs)} pairs ({usable_pct:.1f}%) fall within "
           f"+/-{window_days} days and will be usable for training")
-    if usable_pct < 70:
+    
+    # If hybrid candidate pool is enabled, check how many additional pairs are recoverable
+    # Note: This can be slow with RAG enabled, so we show progress
+    if candidate_fn is not None and unusable_by_window > 0:
+        print(f"  Checking recovery for {unusable_by_window} out-of-window pairs (this may take a moment)...")
+        recovered_by_hybrid = 0
+        checked = 0
+        for i, j in pairs:
+            delta_h = abs((df.loc[i, "created_time"] - df.loc[j, "created_time"]).total_seconds() / 3600)
+            if delta_h > window_days * 24:
+                # This pair is outside the time window - check if it's recovered by hybrid pool
+                # Use the earlier patch as anchor
+                anchor = i if df.loc[i, "created_time"] <= df.loc[j, "created_time"] else j
+                candidate = j if anchor == i else i
+                try:
+                    candidates = candidate_fn(anchor)
+                    if candidate in candidates:
+                        recovered_by_hybrid += 1
+                except Exception as e:
+                    pass  # Skip if retrieval fails
+                checked += 1
+                if checked % 100 == 0:
+                    print(f"    ... checked {checked}/{unusable_by_window} pairs")
+        
+        if recovered_by_hybrid > 0:
+            sources = []
+            if ann_enabled:
+                sources.append("ANN")
+            if rag_enabled:
+                sources.append("RAG")
+            source_str = " + ".join(sources) if sources else "hybrid"
+            print(f"  \U0001F504 {recovered_by_hybrid}/{unusable_by_window} out-of-window pairs RECOVERED by {source_str} retrieval")
+            total_usable = len(pairs) - unusable_by_window + recovered_by_hybrid
+            print(f"  \u2705 Total usable pairs: {total_usable}/{len(pairs)} ({100*total_usable/len(pairs):.1f}%)")
+        else:
+            if unusable_by_window > 0:
+                print(f"  \u26a0\ufe0f  No additional pairs recovered by hybrid retrieval (consider increasing ann_k, rag_k, or ann_max_days)")
+    
+    if usable_pct < 70 and candidate_fn is None:
         print(f"  \u26a0\ufe0f  over {100 - usable_pct:.0f}% of your labeled pairs are OUTSIDE the "
               f"+/-{window_days}-day window and will be silently dropped. Consider raising --window-days, "
+              f"or enable --ann / --rag-candidates to recover them, "
               f"or confirm this loss is expected (e.g. distant links genuinely shouldn't be retrievable).")
 
 
@@ -400,14 +296,17 @@ def sample_negatives(df, emb, anchor_idx, candidate_idxs, positive_idxs, max_neg
     return hard_negs + easy_negs
 
 
-def build_training_rows(df, emb, emb_disc, anchor_positive_map, window_days, max_negatives, hard_ratio, seed):
+def build_training_rows(df, emb, anchor_positive_map, candidate_fn, max_negatives, hard_ratio, seed):
+    """`candidate_fn(anchor_idx) -> list[int]` supplies the candidate pool for
+    an anchor. Pass a plain time-window function or the hybrid ANN+window
+    wrapper (get_hybrid_candidates) built in main()."""
     rng = np.random.default_rng(seed)
     groups = []
     for anchor_idx, positive_idxs in anchor_positive_map.items():
-        candidate_idxs = get_candidate_indices(df, anchor_idx, window_days)
+        candidate_idxs = candidate_fn(anchor_idx)
         in_window_positives = positive_idxs & set(candidate_idxs)
         if not in_window_positives:
-            continue  # the linked patch fell outside the window; not learnable for this anchor
+            continue  # the linked patch fell outside the candidate pool; not learnable for this anchor
 
         negatives = sample_negatives(df, emb, anchor_idx, candidate_idxs, positive_idxs,
                                       max_negatives, hard_ratio, rng)
@@ -423,13 +322,13 @@ def build_training_rows(df, emb, emb_disc, anchor_positive_map, window_days, max
     return groups
 
 
-def groups_to_frame(df, emb, emb_disc, groups):
+def groups_to_frame(df, emb, groups):
     feat_rows, labels, group_sizes = [], [], []
     for anchor_idx, cand_idxs, cand_labels in groups:
         if not cand_idxs:
             continue
         for cidx, lbl in zip(cand_idxs, cand_labels):
-            feat_rows.append(build_features(df, emb, emb_disc, anchor_idx, cidx))
+            feat_rows.append(build_features(df, emb, anchor_idx, cidx))
             labels.append(lbl)
         group_sizes.append(len(cand_idxs))
     X = pd.DataFrame(feat_rows)
@@ -463,17 +362,29 @@ def train_model(X_train, y_train, group_train, X_test, y_test, group_test, featu
     return model
 
 
-def evaluate(model, df, emb, emb_disc, anchors, window_days, feature_cols, top_k, positives_by_anchor):
-    reciprocal_ranks, recalls = [], []
+def evaluate(model, df, emb, anchors, candidate_fn, feature_cols, top_ks, positives_by_anchor):
+    """Score + rank every anchor ONCE per window, then report MRR and Recall@k.
+
+    k only changes where the ranked list is truncated, so the expensive part
+    (candidate retrieval + feature build + predict + sort) does not depend on
+    k. Calling this once per k repeated that work len(top_ks) times per window
+    -- 24x across [2, 7, 14, 30] x [1, 2, 4, 6, 8, 10] -- for identical output.
+    """
+    if isinstance(top_ks, int):
+        top_ks = [top_ks]
+
+    per_k_recalls = {k: [] for k in top_ks}
+    reciprocal_ranks = []
+
     for anchor_idx in anchors:
-        candidate_idxs = get_candidate_indices(df, anchor_idx, window_days)
+        candidate_idxs = candidate_fn(anchor_idx)
         if not candidate_idxs:
             continue
         positive_set = positives_by_anchor.get(anchor_idx, set()) & set(candidate_idxs)
         if not positive_set:
             continue
 
-        feats = pd.DataFrame([build_features(df, emb, emb_disc, anchor_idx, c) for c in candidate_idxs])
+        feats = pd.DataFrame([build_features(df, emb, anchor_idx, c) for c in candidate_idxs])
         feats = feats.reindex(columns=feature_cols, fill_value=0)
         scores = model.predict(feats)
         order = np.argsort(-scores)
@@ -482,12 +393,13 @@ def evaluate(model, df, emb, emb_disc, anchors, window_days, feature_cols, top_k
         rank = next((r for r, cand in enumerate(ranked, start=1) if cand in positive_set), None)
         reciprocal_ranks.append(1.0 / rank if rank else 0.0)
 
-        recalled = sum(1 for c in ranked[:top_k] if c in positive_set)
-        recalls.append(recalled / len(positive_set))
+        for k in top_ks:
+            recalled = sum(1 for c in ranked[:k] if c in positive_set)
+            per_k_recalls[k].append(recalled / len(positive_set))
 
     mrr = float(np.mean(reciprocal_ranks)) if reciprocal_ranks else 0.0
-    recall_k = float(np.mean(recalls)) if recalls else 0.0
-    return mrr, recall_k, len(reciprocal_ranks)
+    recalls = {k: (float(np.mean(v)) if v else 0.0) for k, v in per_k_recalls.items()}
+    return mrr, recalls, len(reciprocal_ranks)
 
 
 # --------------------------------------------------------------------------
@@ -501,6 +413,14 @@ def main():
     parser.add_argument("--model-out", required=True, help="Path to save the trained model (.pkl).")
     parser.add_argument("--window-days", type=int, default=14)
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--ann-k", type=int, default=50, help="Number of ANN (embedding-similarity) neighbors to add to the candidate pool per anchor.")
+    parser.add_argument("--ann-max-days", type=int, default=90, help="Time bound applied to ANN candidates (wider than --window-days).")
+    parser.add_argument("--disable-ann", action="store_true", help="Fall back to pure time-window candidates (for A/B comparison against the hybrid pool).")
+    parser.add_argument("--ann-exact", action="store_true", help="Use exact (brute-force) FAISS search instead of HNSW. Fine for small datasets; slower to build/query at scale.")
+    parser.add_argument("--rag-candidates", action="store_true", help="Enable RAG-based candidate retrieval (multi-query/file-boost) as an additional candidate source.")
+    parser.add_argument("--rag-k", type=int, default=20, help="Number of RAG candidates to retrieve per anchor.")
+    parser.add_argument("--rag-strategy", choices=["multi_query", "file_boost"], default="multi_query", help="RAG retrieval strategy: 'multi_query' or 'file_boost'.")
+    parser.add_argument("--rag-window-days", type=int, default=30, help="Time window for RAG retrieval (typically wider than --window-days).")
     parser.add_argument("--test-size", type=float, default=0.3, help="Fraction of (time-ordered) anchors held out for testing.")
     parser.add_argument("--max-negatives", type=int, default=20, help="Max negatives sampled per training/eval group.")
     parser.add_argument("--hard-negative-ratio", type=float, default=0.6, help="Fraction of sampled negatives that are 'hard' (high SBERT similarity, unlinked).")
@@ -529,13 +449,68 @@ def main():
     if not pairs:
         raise SystemExit("No ground-truth pairs could be matched to the dataset. Aborting.")
 
-    print("Encoding titles + descriptions + discussion text with SBERT...")
-    emb, emb_disc = load_or_compute_embeddings(df, args.sbert_model, args.embedding_cache)
-    n_with_discussion = int(df["has_discussion"].sum())
-    print(f"  {n_with_discussion}/{len(df)} patches have usable change_log/comments text")
+    print("Encoding titles + descriptions with SBERT...")
+    emb = load_or_compute_embeddings(df, args.sbert_model, args.embedding_cache)
 
     print("Checking ground-truth pair coverage at this window size...")
     report_window_coverage(df, pairs, args.window_days)
+
+    # Build RAG engine if requested
+    rag_engine = None
+    if args.rag_candidates:
+        print(f"Building RAG engine for candidate retrieval (strategy={args.rag_strategy}, k={args.rag_k})...")
+        rag_engine = ImprovedRAGEngine(use_hybrid=True)
+        # The engine reads the CSV unsorted while this trainer's df is sorted by
+        # created_time, so the two can never share one cache file -- sharing it
+        # would make each side invalidate the other's fingerprint on every run.
+        rag_cache = None
+        if args.embedding_cache:
+            _p = Path(args.embedding_cache)
+            rag_cache = str(_p.with_name(f"{_p.stem}_rag{_p.suffix or '.npy'}"))
+        rag_engine.load_project("train", args.dataset, embeddings_path=rag_cache)
+        print(f"  RAG engine initialized with {len(rag_engine.datasets.get('train', []))} patches")
+
+    if args.disable_ann and not args.rag_candidates:
+        print("ANN and RAG retrieval disabled — using pure time-window candidates.")
+        cand_index = None
+    else:
+        print(f"Building FAISS candidate index (ann_k={args.ann_k}, ann_max_days={args.ann_max_days})...")
+        cand_index = CandidateIndex.build(
+            emb, df["created_time"].to_numpy(),
+            use_hnsw=not args.ann_exact,
+            df=df,
+            rag_engine=rag_engine,
+        )
+
+    def get_hybrid_candidates(anchor_idx, window_days):
+        """Time-window candidates unioned with ANN (embedding-similarity)
+        neighbors and optionally RAG-based candidates, so ground-truth pairs
+        outside the window are still reachable at train and eval time.
+        Falls back to pure time-window candidates if both ANN and RAG are disabled."""
+        time_window_fn = lambda a: get_candidate_indices(df, a, window_days)
+        if cand_index is None:
+            return time_window_fn(anchor_idx)
+        return cand_index.get_candidates(
+            anchor_idx=anchor_idx,
+            emb=emb,
+            window_days=window_days,
+            ann_k=args.ann_k,
+            ann_max_days=args.ann_max_days,
+            time_window_fn=time_window_fn,
+            rag_k=args.rag_k if args.rag_candidates else 0,
+            rag_strategy=args.rag_strategy,
+            rag_window_days=args.rag_window_days,
+        )
+
+    # Re-run coverage diagnostic with hybrid candidate pool to show recovery
+    if cand_index is not None:
+        print("\nRe-checking coverage with hybrid candidate pool...")
+        report_window_coverage(
+            df, pairs, args.window_days,
+            candidate_fn=lambda a: get_hybrid_candidates(a, args.window_days),
+            ann_enabled=not args.disable_ann,
+            rag_enabled=args.rag_candidates,
+        )
 
     print("Assigning canonical anchor per pair (earlier-created patch)...")
     positives_by_anchor = {}
@@ -552,11 +527,12 @@ def main():
     print("Building training groups (with hard-negative sampling)...")
     train_map = {a: positives_by_anchor[a] for a in train_anchors}
     test_map = {a: positives_by_anchor[a] for a in test_anchors}
-    train_groups = build_training_rows(df, emb, emb_disc, train_map, args.window_days, args.max_negatives, args.hard_negative_ratio, args.seed)
-    test_groups = build_training_rows(df, emb, emb_disc, test_map, args.window_days, args.max_negatives, args.hard_negative_ratio, args.seed + 1)
+    train_candidate_fn = lambda a: get_hybrid_candidates(a, args.window_days)
+    train_groups = build_training_rows(df, emb, train_map, train_candidate_fn, args.max_negatives, args.hard_negative_ratio, args.seed)
+    test_groups = build_training_rows(df, emb, test_map, train_candidate_fn, args.max_negatives, args.hard_negative_ratio, args.seed + 1)
 
-    X_train, y_train, group_sizes_train = groups_to_frame(df, emb, emb_disc, train_groups)
-    X_test, y_test, group_sizes_test = groups_to_frame(df, emb, emb_disc, test_groups)
+    X_train, y_train, group_sizes_train = groups_to_frame(df, emb, train_groups)
+    X_test, y_test, group_sizes_test = groups_to_frame(df, emb, test_groups)
 
     if X_train.empty or X_test.empty:
         raise SystemExit("Train or test set ended up empty (no anchors had an in-window positive). "
@@ -583,7 +559,7 @@ def main():
     model = train_model(X_train, y_train, group_sizes_train, X_test, y_test, group_sizes_test,
                          feature_cols, lgb_params, args.num_boost_round, args.early_stopping_rounds)
 
-    eval_windows = [2]
+    eval_windows = [2, 7, 14, 30]
     eval_top_ks  = [1, 2, 4, 6, 8, 10]
 
     print("\n" + "=" * 60)
@@ -595,12 +571,13 @@ def main():
         header = f"  {'k':>4}  {'MRR':>8}  {'Recall@k':>10}  {'#anchors':>9}"
         print(header)
         print("  " + "-" * (len(header) - 2))
+        eval_candidate_fn = lambda a, win=win: get_hybrid_candidates(a, win)
+        mrr, recalls, n_eval = evaluate(
+            model, df, emb, test_anchors,
+            eval_candidate_fn, feature_cols, eval_top_ks, positives_by_anchor
+        )
         for k in eval_top_ks:
-            mrr, recall_k, n_eval = evaluate(
-                model, df, emb, emb_disc, test_anchors,
-                win, feature_cols, k, positives_by_anchor
-            )
-            print(f"  {k:>4}  {mrr:>8.4f}  {recall_k:>10.4f}  {n_eval:>9}")
+            print(f"  {k:>4}  {mrr:>8.4f}  {recalls[k]:>10.4f}  {n_eval:>9}")
 
     importances = sorted(zip(feature_cols, model.feature_importance()), key=lambda x: -x[1])
     print("Top feature importances:")
@@ -613,8 +590,12 @@ def main():
         "model": model,
         "feature_cols": feature_cols,
         "window_days": args.window_days,
+        "eval_window_days": 2,  # Bug B fix: Save the eval window the model was validated at
         "top_k": args.top_k,
         "sbert_model_name": args.sbert_model,
+        "ann_enabled": not args.disable_ann,
+        "ann_k": args.ann_k,
+        "ann_max_days": args.ann_max_days,
     }, out_path)
     print(f"Model saved to {out_path}")
 

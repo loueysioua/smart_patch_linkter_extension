@@ -3,8 +3,11 @@ flask-cors
 pandas
 numpy
 scikit-learn
+lightgbm
 sentence-transformers
 requests
 joblib
 google-genai
-
+faiss-cpu
+openai
+python-dotenv

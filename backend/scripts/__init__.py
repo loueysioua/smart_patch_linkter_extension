@@ -1,0 +1,2 @@
+"""SmartPatch standalone scripts package."""
+
