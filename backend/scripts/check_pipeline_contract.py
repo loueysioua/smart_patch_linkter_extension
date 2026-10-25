@@ -43,7 +43,6 @@ def _toy_df(n=6, seed=0):
         "description": [f"body {i}" for i in range(n)],
         "created_time": [base + pd.Timedelta(days=int(d)) for d in rng.integers(0, 60, n)],
         "files_parsed": [["a/b.py", "c/d.py"] if i % 2 else ["x/y.py"] for i in range(n)],
-        "discussion_text": [f"msg {i}" if i % 3 else "" for i in range(n)],
     })
 
 
@@ -84,26 +83,28 @@ def test_cache_rejects_reordering():
 def test_features_match_saved_model():
     """Training and serving must compute the model's exact feature set."""
     df = _toy_df()
-    df["has_discussion"] = df["discussion_text"].str.strip().str.len() > 0
     df["ticket_refs"] = [set() if i % 2 else {"BUG-1"} for i in range(len(df))]
 
     rng = np.random.default_rng(1)
     emb = rng.normal(size=(len(df), 8))
-    emb_disc = rng.normal(size=(len(df), 8))
 
-    feats = build_pair_features(df, emb, emb_disc, 0, 1)
+    feats = build_pair_features(df, emb, 0, 1)
 
     # symmetric: LambdaRank groups must not depend on argument order
-    flipped = build_pair_features(df, emb, emb_disc, 1, 0)
+    flipped = build_pair_features(df, emb, 1, 0)
     for key in feats:
         assert np.isclose(feats[key], flipped[key]), f"asymmetric feature: {key}"
 
     expected = {
         "jaccard", "nb_shared", "abs_delta_files", "min_len_files", "max_len_files",
         "same_component", "LCP_mean", "LCP_max", "LCSuff_mean", "LCSuff_max",
-        "sim_cosine", "token_jaccard", "delta_time_hours", "sim_cosine_discussion",
-        "token_jaccard_discussion", "has_discussion_both", "shares_ticket_ref",
+        "sim_cosine", "token_jaccard", "delta_time_hours", "shares_ticket_ref",
     }
+    # Guard the leak fix: these three compared the anchor's post-submission
+    # review history against the candidate's. They must never come back.
+    for leaked in ("sim_cosine_discussion", "token_jaccard_discussion",
+                   "has_discussion_both"):
+        assert leaked not in feats, f"leaky feature reintroduced: {leaked}"
     assert set(feats) == expected, (
         f"feature set drifted: missing={expected - set(feats)} extra={set(feats) - expected}"
     )
@@ -114,9 +115,10 @@ def test_features_match_saved_model():
 
     import joblib
     feature_cols = set(joblib.load(MODEL_PATH)["feature_cols"])
-    missing = feature_cols - set(feats)
-    assert not missing, (
-        f"model needs features build_pair_features does not compute: {sorted(missing)}"
+    extra = feature_cols - set(feats)
+    assert not extra, (
+        f"saved model at {MODEL_PATH} still expects {sorted(extra)} -- it was "
+        f"trained before the discussion-leak fix. Retrain to get a 14-feature model."
     )
     print(f"  saved model needs {len(feature_cols)} features, all produced")
 

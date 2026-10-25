@@ -144,26 +144,35 @@ def token_jaccard(text_a: str, text_b: str) -> float:
 def build_pair_features(
     df,
     emb: np.ndarray,
-    emb_disc: np.ndarray,
     i: int,
     j: int,
 ) -> dict[str, float]:
-    """Build the 17 pairwise features for rows ``i`` and ``j`` of ``df``.
+    """Build the 14 pairwise features for rows ``i`` and ``j`` of ``df``.
 
     This is THE feature contract. Training (``ml_pipeline``) and serving
     (``scripts/ml_to_rag_pipeline.py``) both call this so a saved model's
     ``feature_cols`` can never drift away from what serving computes.
 
-    ``emb`` / ``emb_disc`` must be row-aligned with ``df`` -- use
+    Only information observable at the anchor's submission time may appear
+    here. That rules out the anchor's own review history: at ``created_time``
+    a change has its title, description and first patchset and nothing else.
+    Three former features (sim_cosine_discussion, token_jaccard_discussion,
+    has_discussion_both) compared the anchor's post-submission reviews
+    against the candidate's, so they leaked the future. They were dropped
+    rather than time-truncated: measured over 8,000 patches, 93.2% of
+    change_log entries and 100% of comments postdate created_time, only 0.7%
+    of discussion text survives a cutoff, and 90.8% of that remainder is
+    "Uploaded patch set N". They would have been constants at serve time.
+
+    ``emb`` must be row-aligned with ``df`` -- use
     ``assert_embeddings_aligned`` if that alignment is not already guaranteed
     by the caller.
 
     Args:
         df: Frame with ``title``, ``description``, ``created_time``,
-            ``files_parsed``, ``discussion_text``, ``has_discussion`` and
-            ``ticket_refs`` columns.
+            ``files_parsed`` and ``ticket_refs`` columns. ``ticket_refs`` must
+            be derived from title+description only, never from review text.
         emb: Row-aligned title+description embeddings.
-        emb_disc: Row-aligned discussion-text embeddings.
         i: Row index of the anchor patch.
         j: Row index of the candidate patch.
 
@@ -187,20 +196,6 @@ def build_pair_features(
         (row_i["created_time"] - row_j["created_time"]).total_seconds() / 3600
     )
 
-    has_i = bool(row_i.get("has_discussion"))
-    has_j = bool(row_j.get("has_discussion"))
-    if has_i and has_j:
-        feats["sim_cosine_discussion"] = float(cosine_similarity(
-            emb_disc[i].reshape(1, -1), emb_disc[j].reshape(1, -1)
-        )[0][0])
-        feats["token_jaccard_discussion"] = token_jaccard(
-            row_i["discussion_text"], row_j["discussion_text"]
-        )
-    else:
-        feats["sim_cosine_discussion"] = 0.0
-        feats["token_jaccard_discussion"] = 0.0
-
-    feats["has_discussion_both"] = float(has_i and has_j)
     feats["shares_ticket_ref"] = float(bool(
         (row_i.get("ticket_refs") or set()) & (row_j.get("ticket_refs") or set())
     ))
@@ -293,27 +288,6 @@ def safe_parse_json(x) -> list:
         return parsed if isinstance(parsed, list) else []
     except ValueError:  # includes json.JSONDecodeError
         return []
-
-
-def extract_discussion_text(row) -> str:
-    """Best-effort discussion blob from a row's change_log / comments entries.
-
-    Shared by training and serving so ``discussion_text`` -- and therefore the
-    discussion embeddings fingerprinted against it -- is built identically on
-    both sides.
-    """
-    parts: list[str] = []
-    for parsed_key in ("change_log_parsed", "comments_parsed"):
-        for entry in (row.get(parsed_key) or []):
-            if isinstance(entry, dict):
-                for key in ("message", "text", "body", "comment", "description"):
-                    val = entry.get(key)
-                    if val:
-                        parts.append(str(val))
-                        break
-            elif isinstance(entry, str):
-                parts.append(entry)
-    return " ".join(parts)
 
 
 def extract_ticket_refs(text: str) -> set[str]:

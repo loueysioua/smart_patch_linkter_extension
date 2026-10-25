@@ -40,7 +40,6 @@ from core.utils import (
     build_pair_features,
     cache_is_valid,
     embeddings_fingerprint,
-    extract_discussion_text,
     extract_ticket_refs,
     get_path_similarity_stats,
     safe_parse_json,
@@ -131,12 +130,8 @@ class MLToRAGPipeline:
         if project in self.rag_engine.datasets:
             print(f"\n� Reusing RAG engine's dataset for {project} (consistent ordering)...")
             self.df = self.rag_engine.datasets[project].copy()
-            # Add the extra columns needed by ML pipeline that RAG engine doesn't set
-            self.df["change_log_parsed"] = self.df["change_log"].apply(safe_parse_json) if "change_log" in self.df.columns else [[] for _ in range(len(self.df))]
-            self.df["comments_parsed"] = self.df["comments"].apply(safe_parse_json) if "comments" in self.df.columns else [[] for _ in range(len(self.df))]
-            self.df["discussion_text"] = self.df.apply(extract_discussion_text, axis=1)
-            self.df["has_discussion"] = self.df["discussion_text"].str.strip().str.len() > 0
-            self.df["ticket_refs"] = (self.df["title"] + " " + self.df["description"] + " " + self.df["discussion_text"]).apply(extract_ticket_refs)
+            # title+description only -- see the note in _load_dataset.
+            self.df["ticket_refs"] = (self.df["title"] + " " + self.df["description"]).apply(extract_ticket_refs)
             print(f"   Loaded {len(self.df)} patches")
         else:
             # Fallback: load independently (should not happen in normal flow)
@@ -148,9 +143,7 @@ class MLToRAGPipeline:
         print(f"\n🧮 Computing embeddings for ML features...")
         self.sbert = SentenceTransformer(self.sbert_model_name)
         self.embeddings = self._compute_embeddings()
-        self.discussion_embeddings = self._compute_discussion_embeddings()
         assert_embeddings_aligned(self.df, self.embeddings, "title/description embeddings")
-        assert_embeddings_aligned(self.df, self.discussion_embeddings, "discussion embeddings")
         print(f"   Done!")
         
         # Build patch_id to index mapping
@@ -197,16 +190,10 @@ class MLToRAGPipeline:
         df["description"] = df["description"].fillna("")
         df["files_parsed"] = df["files"].apply(safe_parse_list)
         
-        # Parse change_log and comments for discussion features (Bug A fix)
-        df["change_log_parsed"] = df["change_log"].apply(safe_parse_json) if "change_log" in df.columns else [[] for _ in range(len(df))]
-        df["comments_parsed"] = df["comments"].apply(safe_parse_json) if "comments" in df.columns else [[] for _ in range(len(df))]
-        
-        # Extract discussion text and metadata
-        df["discussion_text"] = df.apply(extract_discussion_text, axis=1)
-        df["has_discussion"] = df["discussion_text"].str.strip().str.len() > 0
-        
-        # Extract ticket references from title + description + discussion
-        df["ticket_refs"] = (df["title"] + " " + df["description"] + " " + df["discussion_text"]).apply(extract_ticket_refs)
+        # Ticket references from title + description ONLY: a ticket named solely
+        # in a review comment did not exist at submission time, so counting it
+        # would leak the future.
+        df["ticket_refs"] = (df["title"] + " " + df["description"]).apply(extract_ticket_refs)
         
         # BUG #1 FIX: Do NOT sort by created_time here!
         # The RAG engine loads the CSV without sorting, and embeddings are computed
@@ -243,69 +230,17 @@ class MLToRAGPipeline:
 
         return embeddings
     
-    def _compute_discussion_embeddings(self) -> np.ndarray:
-        """Compute discussion text embeddings for discussion similarity features.
-        
-        Bug A fix: Now computes real discussion embeddings instead of reusing title+desc.
-        """
-        discussion_texts = self.df["discussion_text"].tolist()
-        
-        # Check cache for discussion embeddings
-        cache_path = f"data/{self.project}/embeddings_cache.npy"
-        if os.path.exists(cache_path):
-            cached = np.load(cache_path, allow_pickle=True).item()
-            if ("discussion_embeddings" in cached
-                    and cached.get("discussion_fingerprint")
-                    == embeddings_fingerprint(self.df["patch_id"], discussion_texts)):
-                print(f"   Loading cached discussion embeddings from {cache_path}")
-                return cached["discussion_embeddings"]
-            print(f"   ⚠️ Discussion embeddings not in cache or stale - computing")
-        
-        # Compute discussion embeddings
-        print(f"   Computing discussion embeddings for {len(discussion_texts)} patches...")
-        discussion_embeddings = self.sbert.encode(
-            discussion_texts, 
-            batch_size=64, 
-            show_progress_bar=True, 
-            convert_to_numpy=True
-        )
-        
-        # Update cache to include discussion embeddings
-        if os.path.exists(cache_path):
-            cached = np.load(cache_path, allow_pickle=True).item()
-            cached["discussion_embeddings"] = discussion_embeddings
-            cached["discussion_fingerprint"] = embeddings_fingerprint(
-                self.df["patch_id"], discussion_texts)
-            np.save(cache_path, cached)
-            print(f"   Cached discussion embeddings to {cache_path}")
-        else:
-            # Create new cache with both embeddings
-            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-            np.save(cache_path, {
-                "embeddings": self.embeddings,
-                "discussion_embeddings": discussion_embeddings,
-                "n_rows": len(self.df),
-                "model_name": self.sbert_model_name,
-                "fingerprint": embeddings_fingerprint(
-                    self.df["patch_id"], title_desc_texts(self.df)),
-                "discussion_fingerprint": embeddings_fingerprint(
-                    self.df["patch_id"], discussion_texts),
-            })
-            print(f"   Created new cache with discussion embeddings at {cache_path}")
-        
-        return discussion_embeddings
-    
     def _get_time_window_candidates(self, anchor_idx: int, window_days: int) -> List[int]:
         """Get candidates within time window."""
         anchor_time = self.df.iloc[anchor_idx]["created_time"]
         start = anchor_time - timedelta(days=window_days)
         end = anchor_time + timedelta(days=window_days)
-        
+
         mask = (self.df["created_time"] >= start) & (self.df["created_time"] <= end)
         candidates = self.df.index[mask].tolist()
-        
+
         return [idx for idx in candidates if idx != anchor_idx]
-    
+
     def _build_features(self, anchor_idx: int, candidate_idx: int) -> Dict[str, float]:
         """Build pairwise features for ML model.
 
@@ -315,7 +250,7 @@ class MLToRAGPipeline:
         reindex(fill_value=0), which is how 4 of 17 features died last time.
         """
         return build_pair_features(
-            self.df, self.embeddings, self.discussion_embeddings,
+            self.df, self.embeddings,
             anchor_idx, candidate_idx,
         )
 
@@ -422,9 +357,9 @@ class MLToRAGPipeline:
         RAG independently scores candidates, then blends with ML scores.
         
         BUG #2 FIX: Now blends ML and RAG scores instead of overriding ML ranking.
-        This preserves the learned signals from the ML model (ticket refs, discussion
-        similarity, time delta, author/reviewer overlap) while incorporating RAG's
-        semantic and file-overlap signals.
+        This preserves the learned signals from the ML model (ticket refs, title/desc
+        similarity, time delta, file overlap) while incorporating RAG's semantic and
+        file-overlap signals.
         
         Args:
             patch_ref: Query patch dict

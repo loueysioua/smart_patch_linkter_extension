@@ -22,7 +22,6 @@ the dataset and in the ground-truth pairs file).
 `files` must be a stringified Python list (e.g. "['a/b.py', 'c/d.py']").
 `change_log` / `comments`, if present, are used for two things:
   1. deriving a reviewer/commenter list per patch (see `extract_reviewers`)
-  2. building a "discussion text" blob per patch (see `extract_discussion_text`)
      which is SBERT-embedded and token-compared the same way title/description
      are, plus scanned for shared ticket/bug references.
 If your schema stores these differently, adjust those two functions — the
@@ -67,7 +66,6 @@ from core.utils import (
     build_pair_features,
     cache_is_valid,
     embeddings_fingerprint,
-    extract_discussion_text,
     extract_ticket_refs,
     safe_parse_json,
     title_desc_texts,
@@ -109,34 +107,27 @@ def load_dataset(csv_path):
     df["description"] = df["description"].fillna("")
     df["author_username"] = df.get("author_username", "").fillna("") if "author_username" in df.columns else ""
     df["files_parsed"] = df["files"].apply(safe_parse_list)
-    df["change_log_parsed"] = df["change_log"].apply(safe_parse_json) if "change_log" in df.columns else [[] for _ in range(len(df))] 
-    df["comments_parsed"] = df["comments"].apply(safe_parse_json) if "comments" in df.columns else [[] for _ in range(len(df))]
-    # df["reviewers"] = df.apply(extract_reviewers, axis=1)
-    df["discussion_text"] = df.apply(extract_discussion_text, axis=1)
-    df["has_discussion"] = df["discussion_text"].str.strip().str.len() > 0
-    df["ticket_refs"] = (df["title"] + " " + df["description"] + " " + df["discussion_text"]).apply(extract_ticket_refs)
+    # title+description only: a ticket named solely in a review comment did not
+    # exist at submission time, so counting it would leak the future.
+    df["ticket_refs"] = (df["title"] + " " + df["description"]).apply(extract_ticket_refs)
     df = df.sort_values("created_time").reset_index(drop=True)
     return df
 
 
 def load_or_compute_embeddings(df, sbert_model_name, cache_path):
     texts = title_desc_texts(df)
-    discussion_texts = df["discussion_text"].tolist()
 
     if cache_path:
         cache_path = Path(cache_path)
         if cache_path.exists():
             cached = np.load(cache_path, allow_pickle=True).item()
-            if (cache_is_valid(cached, df, sbert_model_name, texts)
-                    and cached.get("discussion_fingerprint")
-                    == embeddings_fingerprint(df["patch_id"], discussion_texts)):
+            if cache_is_valid(cached, df, sbert_model_name, texts):
                 print(f"  loaded cached embeddings from {cache_path}")
-                return cached["embeddings"], cached["discussion_embeddings"]
+                return cached["embeddings"]
             print("  cache stale (model/rows/order/text changed) - recomputing")
 
     sbert = SentenceTransformer(sbert_model_name)
     emb = sbert.encode(texts, batch_size=64, show_progress_bar=True, convert_to_numpy=True)
-    emb_disc = sbert.encode(discussion_texts, batch_size=64, show_progress_bar=True, convert_to_numpy=True)
 
     if cache_path:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -144,13 +135,11 @@ def load_or_compute_embeddings(df, sbert_model_name, cache_path):
             "model_name": sbert_model_name,
             "n_rows": len(df),
             "embeddings": emb,
-            "discussion_embeddings": emb_disc,
             "fingerprint": embeddings_fingerprint(df["patch_id"], texts),
-            "discussion_fingerprint": embeddings_fingerprint(df["patch_id"], discussion_texts),
         })
         print(f"  cached embeddings to {cache_path}")
 
-    return emb, emb_disc
+    return emb
 
 
 def load_ground_truth(path, df):
@@ -247,7 +236,7 @@ def sample_negatives(df, emb, anchor_idx, candidate_idxs, positive_idxs, max_neg
     return hard_negs + easy_negs
 
 
-def build_training_rows(df, emb, emb_disc, anchor_positive_map, window_days, max_negatives, hard_ratio, seed):
+def build_training_rows(df, emb, anchor_positive_map, window_days, max_negatives, hard_ratio, seed):
     rng = np.random.default_rng(seed)
     groups = []
     for anchor_idx, positive_idxs in anchor_positive_map.items():
@@ -270,13 +259,13 @@ def build_training_rows(df, emb, emb_disc, anchor_positive_map, window_days, max
     return groups
 
 
-def groups_to_frame(df, emb, emb_disc, groups):
+def groups_to_frame(df, emb, groups):
     feat_rows, labels, group_sizes = [], [], []
     for anchor_idx, cand_idxs, cand_labels in groups:
         if not cand_idxs:
             continue
         for cidx, lbl in zip(cand_idxs, cand_labels):
-            feat_rows.append(build_pair_features(df, emb, emb_disc, anchor_idx, cidx))
+            feat_rows.append(build_pair_features(df, emb, anchor_idx, cidx))
             labels.append(lbl)
         group_sizes.append(len(cand_idxs))
     X = pd.DataFrame(feat_rows)
@@ -310,7 +299,7 @@ def train_model(X_train, y_train, group_train, X_test, y_test, group_test, featu
     return model
 
 
-def evaluate(model, df, emb, emb_disc, anchors, window_days, feature_cols, top_ks, positives_by_anchor):
+def evaluate(model, df, emb, anchors, window_days, feature_cols, top_ks, positives_by_anchor):
     """Score + rank every anchor ONCE, then report MRR and Recall@k for each k.
 
     k only changes where the ranked list is truncated, so the expensive part
@@ -331,7 +320,7 @@ def evaluate(model, df, emb, emb_disc, anchors, window_days, feature_cols, top_k
         if not positive_set:
             continue
 
-        feats = pd.DataFrame([build_pair_features(df, emb, emb_disc, anchor_idx, c) for c in candidate_idxs])
+        feats = pd.DataFrame([build_pair_features(df, emb, anchor_idx, c) for c in candidate_idxs])
         feats = feats.reindex(columns=feature_cols, fill_value=0)
         scores = model.predict(feats)
         order = np.argsort(-scores)
@@ -389,10 +378,8 @@ def main():
     if not pairs:
         raise SystemExit("No ground-truth pairs could be matched to the dataset. Aborting.")
 
-    print("Encoding titles + descriptions + discussion text with SBERT...")
-    emb, emb_disc = load_or_compute_embeddings(df, args.sbert_model, args.embedding_cache)
-    n_with_discussion = int(df["has_discussion"].sum())
-    print(f"  {n_with_discussion}/{len(df)} patches have usable change_log/comments text")
+    print("Encoding titles + descriptions with SBERT...")
+    emb = load_or_compute_embeddings(df, args.sbert_model, args.embedding_cache)
 
     print("Checking ground-truth pair coverage at this window size...")
     report_window_coverage(df, pairs, args.window_days)
@@ -412,11 +399,11 @@ def main():
     print("Building training groups (with hard-negative sampling)...")
     train_map = {a: positives_by_anchor[a] for a in train_anchors}
     test_map = {a: positives_by_anchor[a] for a in test_anchors}
-    train_groups = build_training_rows(df, emb, emb_disc, train_map, args.window_days, args.max_negatives, args.hard_negative_ratio, args.seed)
-    test_groups = build_training_rows(df, emb, emb_disc, test_map, args.window_days, args.max_negatives, args.hard_negative_ratio, args.seed + 1)
+    train_groups = build_training_rows(df, emb, train_map, args.window_days, args.max_negatives, args.hard_negative_ratio, args.seed)
+    test_groups = build_training_rows(df, emb, test_map, args.window_days, args.max_negatives, args.hard_negative_ratio, args.seed + 1)
 
-    X_train, y_train, group_sizes_train = groups_to_frame(df, emb, emb_disc, train_groups)
-    X_test, y_test, group_sizes_test = groups_to_frame(df, emb, emb_disc, test_groups)
+    X_train, y_train, group_sizes_train = groups_to_frame(df, emb, train_groups)
+    X_test, y_test, group_sizes_test = groups_to_frame(df, emb, test_groups)
 
     if X_train.empty or X_test.empty:
         raise SystemExit("Train or test set ended up empty (no anchors had an in-window positive). "
@@ -455,7 +442,7 @@ def main():
     print(header)
     print("  " + "-" * (len(header) - 2))
     mrr, recalls, n_eval = evaluate(
-        model, df, emb, emb_disc, test_anchors,
+        model, df, emb, test_anchors,
         eval_window, feature_cols, eval_top_ks, positives_by_anchor
     )
     for k in eval_top_ks:
